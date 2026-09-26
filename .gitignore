@@ -26,6 +26,7 @@ release/
 *.jks
 *.keystore
 keystore.properties
+github_ssh_key.txt
 
 # 原生 / 日志
 *.log
