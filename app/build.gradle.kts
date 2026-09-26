@@ -26,6 +26,18 @@ android {
         }
     }
 
+    // 按 ABI 拆包：除各架构专属包外，额外产出一个 universal 全量包。
+    // 注意 universalApk = true 时，全量包的文件名也叫 app-release.apk，
+    // 只有专属包才带 -arm64-v8a 之类的后缀，两者不会重名。
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+            isUniversalApk = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
