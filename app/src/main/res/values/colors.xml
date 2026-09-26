@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动图标底色：与 UFITOOLS-UI 标志原图的纯黑背景一致 -->
+    <color name="ic_launcher_background">#000000</color>
+
+    <!-- 桌面小组件：固定深色卡片，保证在任何壁纸下都可读 -->
+    <color name="widget_bg">#E61C1C1E</color>
+    <color name="widget_text_primary">#FFFFFFFF</color>
+    <color name="widget_text_secondary">#B8FFFFFF</color>
+    <color name="widget_text_muted">#7AFFFFFF</color>
+    <color name="widget_divider">#1FFFFFFF</color>
+    <!-- 信号柱：未点亮的柱底色；点亮色由渲染器按 App 主题强调色覆盖 -->
+    <color name="widget_bar_off">#33FFFFFF</color>
+    <color name="widget_accent">#FF3B82F6</color>
+    <color name="widget_good">#FF34C759</color>
+    <color name="widget_warn">#FFFF9F0A</color>
+    <color name="widget_bad">#FFFF453A</color>
+</resources>

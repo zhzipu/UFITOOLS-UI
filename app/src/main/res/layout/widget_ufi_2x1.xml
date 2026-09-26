@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  桌面小组件 2x1：最紧凑的一格。
+  只保留「信号 + 电量 + 今日流量 + 刷新」，标题类文案全部省掉，靠位置表达含义。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="12dp"
+    android:paddingEnd="8dp"
+    android:paddingTop="5dp"
+    android:paddingBottom="5dp">
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="bottom"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/widget_bar1"
+            android:layout_width="3dp"
+            android:layout_height="4dp"
+            android:background="@color/widget_bar_off"
+            android:contentDescription="@null" />
+
+        <ImageView
+            android:id="@+id/widget_bar2"
+            android:layout_width="3dp"
+            android:layout_height="7dp"
+            android:layout_marginStart="2dp"
+            android:background="@color/widget_bar_off"
+            android:contentDescription="@null" />
+
+        <ImageView
+            android:id="@+id/widget_bar3"
+            android:layout_width="3dp"
+            android:layout_height="10dp"
+            android:layout_marginStart="2dp"
+            android:background="@color/widget_bar_off"
+            android:contentDescription="@null" />
+
+        <ImageView
+            android:id="@+id/widget_bar4"
+            android:layout_width="3dp"
+            android:layout_height="13dp"
+            android:layout_marginStart="2dp"
+            android:background="@color/widget_bar_off"
+            android:contentDescription="@null" />
+
+        <ImageView
+            android:id="@+id/widget_bar5"
+            android:layout_width="3dp"
+            android:layout_height="16dp"
+            android:layout_marginStart="2dp"
+            android:background="@color/widget_bar_off"
+            android:contentDescription="@null" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/widget_battery"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:text="@string/widget_placeholder_short"
+        android:textColor="@color/widget_text_primary"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/widget_day"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="10dp"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:text="@string/widget_placeholder_day"
+        android:textColor="@color/widget_accent"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <ImageView
+        android:id="@+id/widget_refresh"
+        android:layout_width="20dp"
+        android:layout_height="20dp"
+        android:layout_marginStart="6dp"
+        android:contentDescription="@string/widget_action_refresh"
+        android:padding="2dp"
+        android:src="@drawable/ic_widget_refresh" />
+</LinearLayout>

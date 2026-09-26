@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">UFITOOLS-UI</string>
+
+    <!-- 桌面小组件：名称与描述（显示在系统的「添加小组件」列表里） -->
+    <string name="widget_4x2_name">UFI 状态 4×2</string>
+    <string name="widget_4x1_name">UFI 状态 4×1</string>
+    <string name="widget_2x1_name">UFI 状态 2×1</string>
+    <string name="widget_4x2_desc">设备型号、信号、今日与本月流量、温度与占用一屏看全</string>
+    <string name="widget_4x1_desc">单行显示信号、制式、今日流量与温度</string>
+    <string name="widget_2x1_desc">最紧凑的一格：信号、电量与今日流量</string>
+
+    <!-- 桌面小组件：标签与动作 -->
+    <string name="widget_label_day">今日已用</string>
+    <string name="widget_label_month">本月累计</string>
+    <string name="widget_action_refresh">刷新</string>
+
+    <!-- 桌面小组件：布局里的占位文案（真实值在渲染时覆盖；也用于「添加小组件」的预览图） -->
+    <string name="widget_placeholder_model">UFI</string>
+    <string name="widget_placeholder_day">今日 --</string>
+    <string name="widget_placeholder_value">--</string>
+    <string name="widget_placeholder_short">--</string>
+    <string name="widget_placeholder_meta">--</string>
+</resources>

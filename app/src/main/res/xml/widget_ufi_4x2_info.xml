@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  UFI 状态 4×2。
+  单元格尺寸换算沿用官方公式：minWidth = 70 * 列数 - 30（行同理）。
+  targetCellWidth/Height、previewLayout、description 都是 API 31+ 才生效的属性，
+  低版本系统会直接忽略，不影响加载。
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/widget_4x2_desc"
+    android:initialLayout="@layout/widget_ufi_4x2"
+    android:minHeight="110dp"
+    android:minResizeHeight="40dp"
+    android:minResizeWidth="110dp"
+    android:minWidth="250dp"
+    android:previewLayout="@layout/widget_ufi_4x2"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellHeight="2"
+    android:targetCellWidth="4"
+    android:updatePeriodMillis="1800000"
+    android:widgetCategory="home_screen" />

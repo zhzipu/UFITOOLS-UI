@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  桌面小组件 4x2：设备状态一屏看全。
+
+  只使用 RemoteViews 允许的控件（LinearLayout / TextView / ImageView），
+  不要在这里放 <View>、自定义 View 或 ConstraintLayout —— 远端进程无法 inflate。
+  信号柱用 5 个 ImageView 高度递增 + 底部对齐拼成，点亮与否由 setBackgroundColor 控制。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg"
+    android:orientation="vertical"
+    android:padding="14dp">
+
+    <!-- 第一行：图标 + 型号 + 信号柱 + 制式 + 电量 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="16dp"
+            android:layout_height="16dp"
+            android:contentDescription="@null"
+            android:src="@drawable/ic_widget_wifi" />
+
+        <TextView
+            android:id="@+id/widget_model"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="7dp"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="@string/widget_placeholder_model"
+            android:textColor="@color/widget_text_primary"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:gravity="bottom"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:id="@+id/widget_bar1"
+                android:layout_width="3dp"
+                android:layout_height="5dp"
+                android:background="@color/widget_bar_off"
+                android:contentDescription="@null" />
+
+            <ImageView
+                android:id="@+id/widget_bar2"
+                android:layout_width="3dp"
+                android:layout_height="8dp"
+                android:layout_marginStart="2dp"
+                android:background="@color/widget_bar_off"
+                android:contentDescription="@null" />
+
+            <ImageView
+                android:id="@+id/widget_bar3"
+                android:layout_width="3dp"
+                android:layout_height="11dp"
+                android:layout_marginStart="2dp"
+                android:background="@color/widget_bar_off"
+                android:contentDescription="@null" />
+
+            <ImageView
+                android:id="@+id/widget_bar4"
+                android:layout_width="3dp"
+                android:layout_height="14dp"
+                android:layout_marginStart="2dp"
+                android:background="@color/widget_bar_off"
+                android:contentDescription="@null" />
+
+            <ImageView
+                android:id="@+id/widget_bar5"
+                android:layout_width="3dp"
+                android:layout_height="17dp"
+                android:layout_marginStart="2dp"
+                android:background="@color/widget_bar_off"
+                android:contentDescription="@null" />
+        </LinearLayout>
+
+        <!-- 运营商品牌标识：运行时由 setImageViewResource 换成实际那一家 -->
+        <ImageView
+            android:id="@+id/widget_carrier"
+            android:layout_width="16dp"
+            android:layout_height="16dp"
+            android:layout_marginEnd="5dp"
+            android:contentDescription="@null"
+            android:src="@drawable/ic_carrier_generic" />
+
+        <TextView
+            android:id="@+id/widget_nettype"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:text="@string/widget_placeholder_short"
+            android:textColor="@color/widget_accent"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/widget_battery"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/widget_placeholder_short"
+            android:textColor="@color/widget_text_primary"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- 第二行：今日 / 本月 流量（大数值） -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="6dp"
+        android:layout_weight="1"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/widget_label_day"
+                android:textColor="@color/widget_text_secondary"
+                android:textSize="10sp" />
+
+            <TextView
+                android:id="@+id/widget_day"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="1dp"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="@string/widget_placeholder_value"
+                android:textColor="@color/widget_accent"
+                android:textSize="21sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <ImageView
+            android:layout_width="1dp"
+            android:layout_height="30dp"
+            android:background="@color/widget_divider"
+            android:contentDescription="@null" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/widget_label_month"
+                android:textColor="@color/widget_text_secondary"
+                android:textSize="10sp" />
+
+            <TextView
+                android:id="@+id/widget_month"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="1dp"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="@string/widget_placeholder_value"
+                android:textColor="@color/widget_text_primary"
+                android:textSize="21sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 第三行：温度 / CPU / 内存 / 信号 + 更新时间 + 刷新 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/widget_meta"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="@string/widget_placeholder_meta"
+            android:textColor="@color/widget_text_secondary"
+            android:textSize="11sp" />
+
+        <TextView
+            android:id="@+id/widget_updated"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:text="@string/widget_placeholder_short"
+            android:textColor="@color/widget_text_muted"
+            android:textSize="11sp" />
+
+        <ImageView
+            android:id="@+id/widget_refresh"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:contentDescription="@string/widget_action_refresh"
+            android:padding="3dp"
+            android:src="@drawable/ic_widget_refresh" />
+    </LinearLayout>
+</LinearLayout>
