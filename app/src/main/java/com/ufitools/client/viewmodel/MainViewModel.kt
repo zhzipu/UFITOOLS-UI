@@ -7,24 +7,32 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonElement
+import com.google.gson.JsonNull
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
 import com.ufitools.client.data.ClientIconStore
 import com.ufitools.client.data.ConfigStore
 import com.ufitools.client.data.DeviceConfig
 import com.ufitools.client.data.RefreshInterval
 import com.ufitools.client.data.ThemeStore
+import com.ufitools.client.model.ApnProfile
 import com.ufitools.client.model.ClientDevice
 import com.ufitools.client.model.ClientIcon
 import com.ufitools.client.model.IW_STATION_DUMP_CMD
 import com.ufitools.client.model.POWER_UBUS_CMD
 import com.ufitools.client.model.PowerMode
 import com.ufitools.client.model.PowerStatus
+import com.ufitools.client.model.ScheduledTask
 import com.ufitools.client.model.SmsMessage
+import com.ufitools.client.model.StorePlugin
+import com.ufitools.client.model.UploadedFile
+import com.ufitools.client.model.UsagePoint
 import com.ufitools.client.model.detectClientIcon
 import com.ufitools.client.model.kickClientCmd
 import com.ufitools.client.model.parseIwStationDump
 import com.ufitools.client.model.parsePowerStatusUbus
+import com.ufitools.client.model.parseUsagePoints
 import com.ufitools.client.network.ApiClient
 import com.ufitools.client.network.ApiException
 import com.ufitools.client.network.GoformClient
@@ -45,6 +53,78 @@ sealed class ConnectionStatus {
     object Connecting : ConnectionStatus()
     data class Connected(val model: String) : ConnectionStatus()
     data class Error(val message: String) : ConnectionStatus()
+}
+
+/**
+ * 短信转发的完整配置（API 文档 §6.3）。
+ *
+ * 设备把不同转发方式拆成了 4 组接口：方式选择 + 各自的参数。界面需要一次把这些
+ * 都读出来，所以这里聚合为一个数据类；保存时按 [method] 只提交对应那一组。
+ */
+data class SmsForwardConfig(
+    /** `SMTP` / `CURL` / `DINGTALK` */
+    val method: String = "SMTP",
+    // --- SMTP ---
+    val smtpHost: String = "",
+    val smtpPort: String = "465",
+    val smtpTo: String = "",
+    val smtpUsername: String = "",
+    val smtpPassword: String = "",
+    val mailForwardDevInfo: Boolean = false,
+    // --- CURL ---
+    val curlText: String = "",
+    val curlForwardDevInfo: Boolean = false,
+    // --- 钉钉 ---
+    val dingtalkWebhook: String = "",
+    val dingtalkSecret: String = "",
+    val dingtalkForwardDevInfo: Boolean = false,
+    // --- 黑名单 ---
+    val blacklistPhones: String = "",
+    val blacklistKeywords: String = "",
+) {
+    companion object {
+        val METHODS = listOf(
+            "SMTP" to "邮件",
+            "CURL" to "CURL 请求",
+            "DINGTALK" to "钉钉机器人",
+        )
+
+        fun methodLabel(v: String): String = METHODS.firstOrNull { it.first == v }?.second ?: v
+
+        private fun JsonObject.s(key: String): String =
+            get(key)?.let { if (it.isJsonNull) "" else it.asString } ?: ""
+
+        private fun JsonObject.boolish(key: String): Boolean =
+            s(key).let { it == "1" || it.equals("true", true) || it.equals("on", true) }
+
+        /** 从四组接口的响应里拼出完整配置 */
+        fun merge(
+            methodObj: JsonObject?,
+            mail: JsonObject?,
+            curl: JsonObject?,
+            dingtalk: JsonObject?,
+            blacklist: JsonObject?,
+        ): SmsForwardConfig {
+            val methodRaw = methodObj?.s("method").orEmpty()
+                .ifEmpty { methodObj?.s("type").orEmpty() }
+            return SmsForwardConfig(
+                method = methodRaw.ifEmpty { "SMTP" }.uppercase(),
+                smtpHost = mail?.s("smtp_host").orEmpty(),
+                smtpPort = mail?.s("smtp_port").orEmpty().ifEmpty { "465" },
+                smtpTo = mail?.s("smtp_to").orEmpty(),
+                smtpUsername = mail?.s("smtp_username").orEmpty(),
+                smtpPassword = mail?.s("smtp_password").orEmpty(),
+                mailForwardDevInfo = mail?.boolish("forward_dev_info") ?: false,
+                curlText = curl?.s("curl_text").orEmpty(),
+                curlForwardDevInfo = curl?.boolish("forward_dev_info") ?: false,
+                dingtalkWebhook = dingtalk?.s("webhook_url").orEmpty(),
+                dingtalkSecret = dingtalk?.s("secret").orEmpty(),
+                dingtalkForwardDevInfo = dingtalk?.boolish("forward_dev_info") ?: false,
+                blacklistPhones = blacklist?.s("phone").orEmpty(),
+                blacklistKeywords = blacklist?.s("keywords").orEmpty(),
+            )
+        }
+    }
 }
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
@@ -107,6 +187,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var selinux by mutableStateOf<String?>(null)
         private set
 
+    /** baseDeviceInfo 最新一份（设备信息页扩展字段：CPU/内存/存储等） */
+    var baseExtra by mutableStateOf<JsonObject?>(null)
+        private set
+
     var sms by mutableStateOf<List<SmsMessage>>(emptyList())
         private set
     var smsUnread by mutableStateOf(0)
@@ -136,6 +220,97 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     var smsForward by mutableStateOf(false)
         private set
+
+    // ------------------------------------------------------------------ 新增功能的可观察状态
+
+    /** 短信转发完整配置：method / mail / curl / dingtalk / blacklist */
+    var smsForwardCfg by mutableStateOf<SmsForwardConfig?>(null)
+        private set
+
+    /** 电量变化转发开关 */
+    var powerForward by mutableStateOf(false)
+        private set
+
+    /** 流量历史（按天） */
+    var usagePoints by mutableStateOf<List<UsagePoint>>(emptyList())
+        private set
+
+    /** APN：运营商自动下发档位（只读） */
+    var apnAuto by mutableStateOf<List<ApnProfile>>(emptyList())
+        private set
+
+    /** APN：用户自建档位 */
+    var apnManual by mutableStateOf<List<ApnProfile>>(emptyList())
+        private set
+
+    /** APN 模式：0=自动，1=手动 */
+    var apnMode by mutableStateOf(0)
+        private set
+
+    /** 定时任务列表 */
+    var tasks by mutableStateOf<List<ScheduledTask>>(emptyList())
+        private set
+
+    /** 上传目录文件列表 */
+    var uploads by mutableStateOf<List<UploadedFile>>(emptyList())
+        private set
+
+    /** 插件商店列表 */
+    var storePlugins by mutableStateOf<List<StorePlugin>>(emptyList())
+        private set
+
+    /** 已安装插件名集合（用于在商店里标记"已安装"） */
+    var installedPlugins by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /** 插件未读通知文本列表 */
+    var pluginNotifications by mutableStateOf<List<String>>(emptyList())
+        private set
+
+    /** ttyd 运行状态（true=在跑） */
+    var ttydRunning by mutableStateOf(false)
+        private set
+
+    /** ttyd 监听地址（形如 `192.168.0.1:1146`） */
+    var ttydAddress by mutableStateOf("")
+        private set
+
+    /** ADB 存活信息（含 mode） */
+    var adbInfo by mutableStateOf<JsonObject?>(null)
+        private set
+
+    /** 资源服务器地址 */
+    var resServer by mutableStateOf("")
+        private set
+
+    /** 自定义头部文本 */
+    var customHead by mutableStateOf("")
+        private set
+
+    /** 弱口令检测结果：null=未知，true=弱口令 */
+    var weakToken by mutableStateOf<Boolean?>(null)
+        private set
+
+    /** 各页面的加载/错误状态（key = 页面标识） */
+    var pageLoading by mutableStateOf<Set<String>>(emptySet())
+        private set
+    var pageError by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
+
+    fun markLoading(page: String, loading: Boolean) {
+        pageLoading = if (loading) pageLoading + page else pageLoading - page
+    }
+
+    /**
+     * 记录/清除页面级错误。
+     *
+     * ⚠️ **不能叫 `setPageError`**：`pageError` 是公开 `var`，Kotlin 会自动生成
+     * `setPageError(Map)`，与手写方法在 JVM 上只按名字+参数类型区分 →
+     * 重载解析歧义/签名冲突（曾因此导致编译失败）。故用 `reportPageError`。
+     */
+    fun reportPageError(page: String, msg: String?) {
+        pageError = if (msg == null) pageError - page else pageError + (page to msg)
+    }
 
     /** 终端自定义图标：MAC(小写) -> ClientIcon.key；无记录表示沿用自动识别 */
     private var clientIconOverrides by mutableStateOf(clientIconStore.loadAll())
@@ -171,6 +346,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 上一次刷新短信转发开关的时间（走 /api，单独限流） */
     private var lastSmsForwardAt = 0L
+
+    /** 上一次刷新 WiFi 双频段开关的时间（走 goform 查询命令，单独限流） */
+    private var lastWifiBandAt = 0L
 
     /** 上一次向桌面小组件推送数据的时间（推送很轻，但仍不希望每轮刷新都惊动桌面） */
     private var lastWidgetPushAt = 0L
@@ -269,6 +447,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         val v = o.get("enabled")?.asStringSafe()
         if (!v.isNullOrBlank()) smsForward = v == "1" || v.equals("true", ignoreCase = true)
+    }
+
+    /** 两个 WiFi 频段的开关状态（2.4G / 5G），随主轮询更新；null=未知 */
+    var wifiBands by mutableStateOf<List<Boolean?>>(listOf(null, null))
+        private set
+
+    suspend fun refreshWifiBands() {
+        wifiBands = wifiBandStates()
     }
 
     // ------------------------------------------------------------------ 踢出终端
@@ -405,6 +591,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
          * 但状态几乎不变，没必要跟着「1 秒」档一起跑。
          */
         const val SMS_FORWARD_MIN_INTERVAL_MS = 5_000L
+
+        /**
+         * WiFi 双频段开关状态的最小刷新间隔。
+         *
+         * 走 goform `queryAccessPointInfo`（返回整个 AP 配置，比单字段查询重），
+         * 而频段开关几乎不会变，没必要跟着秒级轮询跑。
+         */
+        const val WIFI_BAND_MIN_INTERVAL_MS = 10_000L
 
         /** 安全取值：null / JsonNull → ""，原始类型取其字符串，对象/数组取 toString。 */
         private fun JsonElement?.asStringSafe(): String = when {
@@ -558,6 +752,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             refreshSmsForward()
         }
 
+        // WiFi 双频段开关：goform 的 queryAccessPointInfo 不在 POLL_FIELDS 里
+        // （它是查询命令、响应较重），单独按更长间隔取，避免影响主轮询节奏。
+        if (forceClients || now - lastWifiBandAt >= WIFI_BAND_MIN_INTERVAL_MS) {
+            lastWifiBandAt = now
+            try {
+                refreshWifiBands()
+            } catch (_: Exception) {
+            }
+        }
+
         // 数据有了就同步给桌面小组件：直接用内存里刚拿到的值，不再多发一次请求
         if (baseOk || liveOk) pushWidgetSnapshot()
     }
@@ -613,6 +817,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val s = api.selinux()
             selinux = s.get("SELinux")?.asStringSafe().takeIf { !it.isNullOrBlank() }
                 ?: s.get("status")?.asStringSafe()
+        } catch (_: Exception) {
+        }
+        try {
+            baseExtra = api.baseDeviceInfo()
         } catch (_: Exception) {
         }
     }
@@ -696,7 +904,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun setDataLimit(params: Map<String, Any>): String = api.setDataLimit(params)
 
-    suspend fun setSmsForward(enabled: Boolean): String = api.setSmsForwardEnabled(enabled)
+    /**
+     * 开关短信转发。⚠️ 不叫 `setSmsForward`——`smsForward` 是公开 `var`，
+     * 其自动生成的 setter 会与手写方法在 JVM 上撞名。命名约定见 [reportPageError]。
+     */
+    suspend fun applySmsForward(enabled: Boolean): String = api.setSmsForwardEnabled(enabled)
 
     suspend fun volteStatus(): JsonObject = api.volteStatus()
 
@@ -802,6 +1014,50 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * 按频段开关 WiFi（API 文档 §5.2）。
+     *
+     * @param chip 0 = 2.4G（`chip1`），1 = 5G（`chip2`）
+     *
+     * 与 [setWifi] 的差别：那个是「总开关、不分频段」，这个精确指定芯片。
+     * 关闭某频段用 `switchWiFiChip` + `SwitchOption=0`（官方 Web 端的频段级开关写法），
+     * 开启用 `switchWiFiChip` + `ChipEnum` + `GuestEnable=0`。
+     */
+    suspend fun setWifiBand(band: Int, on: Boolean): String {
+        val chip = if (band == 0) "chip1" else "chip2"
+        return if (on) {
+            goformAction("switchWiFiChip", mapOf("ChipEnum" to chip, "GuestEnable" to "0"))
+        } else {
+            goformAction("switchWiFiChip", mapOf("ChipEnum" to chip, "SwitchOption" to "0"))
+        }
+    }
+
+    /**
+     * 读取两个频段的开关状态。
+     *
+     * 返回 `[2.4G, 5G]`，元素为 null 表示该频段未知。
+     * 数据源：goform `queryAccessPointInfo` → `ResponseList[].AccessPointSwitchStatus`
+     * + `ChipIndex`；回退字段 `WiFiModuleSwitch`（整体开关，无法区分频段）。
+     */
+    suspend fun wifiBandStates(): List<Boolean?> = try {
+        val o = goform.get(listOf("queryAccessPointInfo"), multiData = true)
+        val list = o.getAsJsonArray("ResponseList")
+            ?.mapNotNull { if (it.isJsonObject) it.asJsonObject else null }
+            ?: emptyList()
+        if (list.isEmpty()) {
+            val all = o.get("WiFiModuleSwitch")?.asStringSafe()
+            listOf(all?.let { it == "1" }, all?.let { it == "1" })
+        } else {
+            listOf(0, 1).map { idx ->
+                list.firstOrNull { it.get("ChipIndex")?.asStringSafe() == idx.toString() }
+                    ?.get("AccessPointSwitchStatus")?.asStringSafe()
+                    ?.let { it == "1" }
+            }
+        }
+    } catch (_: Exception) {
+        listOf(null, null)
+    }
+
+    /**
      * 指示灯。
      *
      * 设备**不支持该设置**：goform 取不到 `indicator_light_switch` 字段，
@@ -864,6 +1120,383 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun atCommand(command: String): String {
         val o = api.atCommand(command)
         return o.get("result")?.asStringSafe() ?: o.toString()
+    }
+
+    // ================================================================== 以下为 API 文档对照新增
+    // 说明：这些方法全部走 UFI-TOOLS 自研 `/api/` 通道（除标注 goform 的以外），
+    // 每个都自带 try/catch，失败时把原因写进 pageError，不影响主轮询。
+
+    /**
+     * 页面级加载包装：自动维护 [pageLoading] / [pageError]，异常时返回 [fallback]。
+     *
+     * 为什么不 inline：`block` 里要调用别的 suspend 函数（`api.xxx()`），
+     * suspend inline 函数里的非 crossinline lambda 不允许这样挂起，用普通
+     * suspend 高阶函数即可，代价只是一次函数调用。
+     */
+    private suspend fun <T> page(page: String, fallback: T, block: suspend () -> T): T {
+        markLoading(page, true)
+        return try {
+            val v = block()
+            reportPageError(page, null)
+            v
+        } catch (e: Exception) {
+            reportPageError(page, e.message ?: "加载失败")
+            fallback
+        } finally {
+            markLoading(page, false)
+        }
+    }
+
+    // ------------------------------------------------------------------ 短信转发完整配置（§6.3）
+
+    suspend fun refreshSmsForwardConfig() {
+        val cfg = page("smsForward", null as SmsForwardConfig?) {
+            val method = try { api.smsForwardMethod() } catch (_: Exception) { null }
+            val mail = try { api.smsForwardMail() } catch (_: Exception) { null }
+            val curl = try { api.smsForwardCurl() } catch (_: Exception) { null }
+            val ding = try { api.smsForwardDingtalk() } catch (_: Exception) { null }
+            val bl = try { api.smsForwardBlacklist() } catch (_: Exception) { null }
+            SmsForwardConfig.merge(method, mail, curl, ding, bl)
+        }
+        if (cfg != null) smsForwardCfg = cfg
+        powerForward = try {
+            api.powerForwardEnabled().get("enabled")?.asStringSafe().let { it == "1" || it == "true" }
+        } catch (_: Exception) {
+            powerForward
+        }
+    }
+
+    suspend fun saveSmsForwardMethod(method: String): String = api.setSmsForwardMethod(method)
+
+    suspend fun saveSmsForwardMail(cfg: SmsForwardConfig): String = api.setSmsForwardMail(
+        mapOf(
+            "smtp_host" to cfg.smtpHost,
+            "smtp_port" to cfg.smtpPort,
+            "smtp_to" to cfg.smtpTo,
+            "smtp_username" to cfg.smtpUsername,
+            "smtp_password" to cfg.smtpPassword,
+            "forward_dev_info" to if (cfg.mailForwardDevInfo) "1" else "0",
+        )
+    )
+
+    suspend fun saveSmsForwardCurl(cfg: SmsForwardConfig): String {
+        // 设备强校验 {{sms-body}} 占位符，缺了会静默不生效，这里提前拦下
+        if (!cfg.curlText.contains("{{sms-body}}")) return "CURL 模板必须包含 {{sms-body}} 占位符"
+        return api.setSmsForwardCurl(
+            mapOf(
+                "curl_text" to cfg.curlText,
+                "forward_dev_info" to if (cfg.curlForwardDevInfo) "1" else "0",
+            )
+        )
+    }
+
+    suspend fun saveSmsForwardDingtalk(cfg: SmsForwardConfig): String = api.setSmsForwardDingtalk(
+        mapOf(
+            "webhook_url" to cfg.dingtalkWebhook,
+            "secret" to cfg.dingtalkSecret,
+            "forward_dev_info" to if (cfg.dingtalkForwardDevInfo) "1" else "0",
+        )
+    )
+
+    suspend fun saveSmsForwardBlacklist(cfg: SmsForwardConfig): String = api.setSmsForwardBlacklist(
+        mapOf(
+            "phone" to cfg.blacklistPhones,
+            "keywords" to cfg.blacklistKeywords,
+        )
+    )
+
+    /**
+     * 开关电量转发。⚠️ 不叫 `setPowerForward`——`powerForward` 是公开 `var`，
+     * 其自动生成的 setter 会与手写方法在 JVM 上撞名。命名约定见 [reportPageError]。
+     */
+    suspend fun applyPowerForward(enabled: Boolean): String =
+        api.setPowerForwardEnabled(enabled).also { if (it == "success") powerForward = enabled }
+
+    // ------------------------------------------------------------------ 蜂窝流量历史（§8）
+
+    /** 拉取最近 [days] 天的按天流量 */
+    suspend fun refreshUsageHistory(days: Int = 30) {
+        val now = System.currentTimeMillis()
+        val start = now - days * 24L * 3600L * 1000L
+        val pts = page("usage", emptyList<UsagePoint>()) {
+            parseUsagePoints(api.cellularUsage(start, now, "date-range"))
+        }
+        usagePoints = pts
+    }
+
+    // ------------------------------------------------------------------ APN（§7）
+
+    suspend fun refreshApn() {
+        data class ApnBundle(val mode: Int, val auto: List<ApnProfile>, val manual: List<ApnProfile>)
+
+        val b = page("apn", null as ApnBundle?) {
+            val modeObj = try { api.apnMode() } catch (_: Exception) { JsonObject() }
+            val mode = modeObj.get("apn_mode")?.asStringSafe()?.toIntOrNull() ?: 0
+            val enabledId = try {
+                api.apnManualEnabled().let { o ->
+                    o.get("profileId")?.asStringSafe()?.takeIf { it.isNotEmpty() }
+                        ?: o.get("profileid")?.asStringSafe()?.takeIf { it.isNotEmpty() }
+                }
+            } catch (_: Exception) { null }
+
+            val autoRoot = try { api.apnAuto() } catch (_: Exception) { JsonObject() }
+            val manualRoot = try { api.apnManual() } catch (_: Exception) { JsonObject() }
+
+            ApnBundle(
+                mode = mode,
+                auto = ApnProfile.collect(autoRoot, fromAuto = true),
+                manual = ApnProfile.collect(manualRoot, fromAuto = false, enabledId = enabledId),
+            )
+        }
+        if (b != null) {
+            apnMode = b.mode
+            apnAuto = b.auto
+            apnManual = b.manual
+        }
+    }
+
+    /**
+     * 切换 APN 模式（0=自动 / 1=手动）。
+     * ⚠️ 不叫 `setApnMode`——`apnMode` 是公开 `var`，其自动生成的 setter
+     * 会与手写方法在 JVM 上撞名。命名约定见 [reportPageError]。
+     */
+    suspend fun applyApnMode(mode: Int): String =
+        api.setApnMode(mode).also { if (it == "success") apnMode = mode }
+
+    suspend fun addApn(p: ApnProfile): String = api.addApnManual(p.toBody())
+
+    suspend fun updateApn(p: ApnProfile): String = api.updateApnManual(p.toBody())
+
+    suspend fun deleteApn(profileId: String): String = api.deleteApnManual(profileId)
+
+    suspend fun enableApn(profileId: String): String = api.enableApnManual(profileId)
+
+    // ------------------------------------------------------------------ 定时任务（§9）
+
+    suspend fun refreshTasks() {
+        tasks = page("tasks", emptyList<ScheduledTask>()) {
+            ScheduledTask.collect(api.listTasks())
+        }
+    }
+
+    /**
+     * 新增定时任务。
+     *
+     * 设备要求 `id` 唯一且非空，这里用时间戳生成；`action` 为自由 JSON，
+     * 由调用方传入（界面只提供"重启"这类常用动作）。
+     */
+    suspend fun addTask(time: String, repeatDaily: Boolean, actionJson: String): String {
+        val body = JsonObject().apply {
+            addProperty("id", System.currentTimeMillis().toString())
+            addProperty("time", time)
+            addProperty("repeatDaily", repeatDaily)
+            add("action", com.google.gson.JsonParser.parseString(actionJson))
+        }
+        return api.addTask(body.toString()).also { if (it == "success") refreshTasks() }
+    }
+
+    suspend fun removeTask(id: String): String =
+        api.removeTask(id).also { if (it == "success") refreshTasks() }
+
+    suspend fun clearTasks(): String =
+        api.clearTasks().also { if (it == "success") refreshTasks() }
+
+    /** goform 计划重启（§5.2 `RESTART_SCHEDULE_SETTING`） */
+    suspend fun setRestartSchedule(enabled: Boolean, time: String): String =
+        goformAction(
+            "RESTART_SCHEDULE_SETTING",
+            mapOf(
+                "restart_schedule_switch" to if (enabled) "1" else "0",
+                "restart_time" to time,
+            )
+        )
+
+    // ------------------------------------------------------------------ WiFi 二维码（§10）
+
+    /** 拉取指定频段的 WiFi 分享二维码 PNG；[chip] 0=2.4G，1=5G */
+    suspend fun wifiQrcode(chip: Int): ByteArray? = page("qrcode$chip", null as ByteArray?) {
+        api.wifiQrcode(chip)
+    }
+
+    // ------------------------------------------------------------------ 上传管理（§11）
+
+    suspend fun refreshUploads() {
+        uploads = page("uploads", emptyList<UploadedFile>()) {
+            UploadedFile.collect(api.listUploads())
+        }
+    }
+
+    suspend fun uploadFile(file: java.io.File, imageOnly: Boolean): String {
+        return try {
+            val o = if (imageOnly) api.uploadImage(file) else api.uploadFile(file)
+            if (o.has("error")) {
+                o.get("error")?.asStringSafe() ?: "上传失败"
+            } else {
+                refreshUploads()
+                "success"
+            }
+        } catch (e: Exception) {
+            e.message ?: "上传失败"
+        }
+    }
+
+    suspend fun deleteUpload(name: String): String =
+        api.deleteImage(name).also { if (it == "success") refreshUploads() }
+
+    suspend fun deleteAllUploads(): String =
+        api.deleteAllUploads().also { if (it == "success") refreshUploads() }
+
+    /** 上传文件的访问地址（免鉴权，可直接给系统浏览器/播放器） */
+    fun uploadUrl(name: String): String = "${config.baseUrl}/api/uploads/$name"
+
+    /** 拉取已上传文件的原始字节（缩略图预览用）；[url] 形如 `/uploads/xxx.png` */
+    suspend fun fetchUploadBytes(url: String): ByteArray? = try {
+        val path = if (url.startsWith("/uploads/")) "/api$url" else url
+        api.getBytes(path)
+    } catch (_: Exception) {
+        null
+    }
+
+    // ------------------------------------------------------------------ 插件商店（§14）
+
+    suspend fun refreshPlugins() {
+        data class PluginBundle(val installed: Set<String>, val store: List<StorePlugin>)
+
+        val b = page("plugins", null as PluginBundle?) {
+            val installedRoot = try { api.pluginList() } catch (_: Exception) { JsonObject() }
+            val installedSet = mutableSetOf<String>()
+            installedRoot.get("plugins")?.takeIf { it.isJsonArray }?.asJsonArray?.forEach { el ->
+                if (el.isJsonObject) {
+                    val o = el.asJsonObject
+                    o.get("name")?.takeIf { !it.isJsonNull }?.asString?.let { installedSet += it }
+                    o.get("public_name")?.takeIf { !it.isJsonNull }?.asString?.let { installedSet += it }
+                }
+            }
+            val storeRoot = try { api.pluginsStore() } catch (_: Exception) { JsonObject() }
+            PluginBundle(installedSet, StorePlugin.collect(storeRoot, installedSet))
+        }
+        if (b != null) {
+            installedPlugins = b.installed
+            storePlugins = b.store
+        }
+        pluginNotifications = page("pluginNotif", emptyList<String>()) {
+            val root = api.pluginNotifications()
+            val arr = root.get("notifications")?.takeIf { it.isJsonArray }?.asJsonArray
+                ?: root.get("list")?.takeIf { it.isJsonArray }?.asJsonArray
+            arr?.mapNotNull { el ->
+                when {
+                    el.isJsonPrimitive -> el.asString
+                    el.isJsonObject -> el.asJsonObject.get("text")?.takeIf { !it.isJsonNull }?.asString
+                        ?: el.asJsonObject.get("title")?.takeIf { !it.isJsonNull }?.asString
+                    else -> null
+                }
+            } ?: emptyList()
+        }
+    }
+
+    suspend fun installPlugin(publicName: String): String =
+        api.pluginInstall(publicName).also { if (it == "success") refreshPlugins() }
+
+    suspend fun uninstallPlugin(name: String): String =
+        api.pluginUninstall(name).also { if (it == "success") refreshPlugins() }
+
+    suspend fun pluginUpdateCheck(): JsonObject = api.pluginUpdateCheck()
+
+    suspend fun pluginChangelog(): JsonObject = api.pluginChangelog()
+
+    suspend fun readPluginNotifications(): String =
+        api.readPluginNotification().also { if (it == "success") pluginNotifications = emptyList() }
+
+    // ------------------------------------------------------------------ ttyd / ADB（§15）
+
+    suspend fun refreshTtyd() {
+        val o = page("ttyd", null as JsonObject?) { api.ttydStatus() }
+        if (o != null) {
+            ttydRunning = o.get("running")?.asStringSafe().let { it == "1" || it == "true" }
+                || o.get("status")?.asStringSafe().equals("running", true)
+                || o.get("code")?.asStringSafe() == "200"
+            ttydAddress = o.get("ip")?.asStringSafe().orEmpty()
+                .ifEmpty { o.get("address")?.asStringSafe().orEmpty() }
+                .ifEmpty { "${config.host}:1146" }
+        }
+    }
+
+    suspend fun startTtyd(port: Int = 1146): String =
+        api.ttydStart(port).also { if (it == "success") refreshTtyd() }
+
+    suspend fun stopTtyd(): String =
+        api.ttydStop().also { if (it == "success") refreshTtyd() }
+
+    /** ttyd 服务地址，供外部浏览器打开 */
+    fun ttydUrl(port: Int = 1146): String = "http://${config.host}:$port"
+
+    suspend fun refreshAdbInfo() {
+        adbInfo = page("adb", null as JsonObject?) {
+            val alive = try { api.adbAlive() } catch (_: Exception) { JsonObject() }
+            val status = try { api.adbStatus() } catch (_: Exception) { JsonObject() }
+            // 注意：JsonObject.add(key, null) 会抛 NPE，缺字段时必须显式放 JsonNull
+            JsonObject().apply {
+                add("alive", alive.get("alive") ?: JsonNull.INSTANCE)
+                add("mode", alive.get("mode") ?: status.get("mode") ?: JsonNull.INSTANCE)
+                add("status", status.get("status") ?: status.get("state") ?: JsonNull.INSTANCE)
+                add("port", status.get("port") ?: alive.get("port") ?: JsonNull.INSTANCE)
+            }
+        }
+    }
+
+    suspend fun setAdbMode(mode: String): String =
+        api.setAdbMode(mode).also { if (it == "success") refreshAdbInfo() }
+
+    // ------------------------------------------------------------------ 后台管理（§3）
+
+    suspend fun updateAdminPwd(password: String): String {
+        val r = api.updateAdminPwd(password)
+        // 改完密码，当前后台密码配置需要同步，否则后续 goform 写操作会全部失败
+        if (r == "success") {
+            config = config.copy(adminPassword = password)
+            configStore.save(config)
+            goformCookie = null
+        }
+        return r
+    }
+
+    suspend fun refreshResServer() {
+        resServer = page("resServer", resServer) {
+            api.getResServer().let { o ->
+                o.get("res_server")?.asStringSafe().orEmpty()
+                    .ifEmpty { o.get("url")?.asStringSafe().orEmpty() }
+            }
+        }
+    }
+
+    suspend fun saveResServer(url: String): String =
+        api.setResServer(url).also { if (it == "success") resServer = url }
+
+    suspend fun refreshCustomHead() {
+        customHead = page("customHead", customHead) {
+            api.getCustomHead().get("text")?.asStringSafe().orEmpty()
+        }
+    }
+
+    suspend fun saveCustomHead(text: String): String =
+        api.setCustomHead(text).also { if (it == "success") customHead = text }
+
+    /** 弱口令检测（§3 `/api/is_weak_token`） */
+    suspend fun refreshWeakToken() {
+        weakToken = page("weakToken", weakToken) {
+            val o = api.isWeakToken()
+            // 字段名在不同固件版本间不一致，取第一个非空的。
+            // asStringSafe() 返回 String?，故整条用 ?. 串起来，最后用 ?: "" 收口。
+            val raw = o.get("weak")?.asStringSafe()?.takeIf { it.isNotEmpty() }
+                ?: o.get("is_weak")?.asStringSafe()?.takeIf { it.isNotEmpty() }
+                ?: o.get("result")?.asStringSafe()?.takeIf { it.isNotEmpty() }
+                ?: ""
+            when {
+                raw == "1" || raw.equals("true", true) -> true
+                raw == "0" || raw.equals("false", true) -> false
+                else -> null
+            }
+        }
     }
 
     // ------------------------------------------------------------------ 生命周期

@@ -7,9 +7,12 @@ import com.ufitools.client.data.DeviceConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -30,6 +33,14 @@ class ApiClient(private val configProvider: () -> DeviceConfig) {
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
+        .addInterceptor(SigningInterceptor({ configProvider().token }, { deviceToken }))
+        .build()
+
+    /** 上传/下载用长超时客户端：设备写入 500MB 文件可能远超 10s */
+    private val ioClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(300, TimeUnit.SECONDS)
         .addInterceptor(SigningInterceptor({ configProvider().token }, { deviceToken }))
         .build()
 
@@ -121,6 +132,50 @@ class ApiClient(private val configProvider: () -> DeviceConfig) {
             .post(ByteArray(0).toRequestBody(null))
             .build()
         return parse(execute(req))
+    }
+
+    suspend fun putJson(path: String, json: String): JsonObject {
+        val req = Request.Builder().url(baseUrl() + path)
+            .put(json.toRequestBody(jsonMedia))
+            .build()
+        return parse(execute(req))
+    }
+
+    suspend fun deleteJson(path: String, json: String? = null): JsonObject {
+        val body = (json ?: "").toRequestBody(jsonMedia)
+        val req = Request.Builder().url(baseUrl() + path).delete(body).build()
+        return parse(execute(req))
+    }
+
+    /**
+     * 拉取原始字节（用于 PNG 二维码、上传文件的图片本体等）。
+     * 失败返回 null，由调用方降级。
+     */
+    suspend fun getBytes(path: String): ByteArray? = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder().url(baseUrl() + path).get().build()
+            ioClient.newCall(req).execute().use { resp ->
+                // 用 if/else 而不是 return@use：use 的作用域返回值就是这里的结果，
+                // 直接从 lambda 里 return 会把 null 与字节混在一起不容易看清
+                if (resp.isSuccessful) resp.body?.bytes() else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun upload(
+        path: String,
+        file: File,
+        fieldName: String = "file",
+        extraFields: Map<String, String> = emptyMap(),
+        contentType: String = "application/octet-stream"
+    ): JsonObject = withContext(Dispatchers.IO) {
+        val builder = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart(fieldName, file.name, file.asRequestBody(contentType.toMediaType()))
+        extraFields.forEach { (k, v) -> builder.addFormDataPart(k, v) }
+        val req = Request.Builder().url(baseUrl() + path).post(builder.build()).build()
+        parse(ioClient.newCall(req).execute().use { it.body?.string() ?: "" })
     }
 
     // ------------------------------------------------------------------ 设备信息（扩展）
@@ -266,4 +321,234 @@ class ApiClient(private val configProvider: () -> DeviceConfig) {
     }
 
     suspend fun smsForwardMethod(): JsonObject = getJson("/api/sms_forward_method")
+
+    suspend fun setSmsForwardMethod(method: String): String {
+        val o = postJson("/api/sms_forward_method", gson.toJson(mapOf("method" to method)))
+        return if (o.isOk()) "success" else o.errMsg("设置转发方式失败")
+    }
+
+    /** SMTP 邮件转发配置，[params] 字段见 API 文档 §6.3 */
+    suspend fun smsForwardMail(): JsonObject = getJson("/api/sms_forward_mail")
+
+    suspend fun setSmsForwardMail(params: Map<String, Any>): String {
+        val o = postJson("/api/sms_forward_mail", gson.toJson(params))
+        return if (o.isOk()) "success" else o.errMsg("保存邮件转发配置失败")
+    }
+
+    /** CURL 转发配置，[params] 至少含 curl_text 且须包含 {{sms-body}} */
+    suspend fun smsForwardCurl(): JsonObject = getJson("/api/sms_forward_curl")
+
+    suspend fun setSmsForwardCurl(params: Map<String, Any>): String {
+        val o = postJson("/api/sms_forward_curl", gson.toJson(params))
+        return if (o.isOk()) "success" else o.errMsg("保存 CURL 转发配置失败")
+    }
+
+    /** 钉钉机器人转发配置 */
+    suspend fun smsForwardDingtalk(): JsonObject = getJson("/api/sms_forward_dingtalk")
+
+    suspend fun setSmsForwardDingtalk(params: Map<String, Any>): String {
+        val o = postJson("/api/sms_forward_dingtalk", gson.toJson(params))
+        return if (o.isOk()) "success" else o.errMsg("保存钉钉转发配置失败")
+    }
+
+    /** 转发黑名单：phone 为号码列表，keywords 为关键词列表 */
+    suspend fun smsForwardBlacklist(): JsonObject = getJson("/api/sms_forward_blacklist")
+
+    suspend fun setSmsForwardBlacklist(params: Map<String, Any>): String {
+        val o = postJson("/api/sms_forward_blacklist", gson.toJson(params))
+        return if (o.isOk()) "success" else o.errMsg("保存黑名单失败")
+    }
+
+    suspend fun powerForwardEnabled(): JsonObject = getJson("/api/power_status_forward_enabled")
+
+    suspend fun setPowerForwardEnabled(enabled: Boolean): String {
+        val o = post("/api/power_status_forward_enabled?enable=${if (enabled) 1 else 0}")
+        return if (o.isOk()) "success" else o.errMsg("设置电量转发失败")
+    }
+
+    // ------------------------------------------------------------------ 蜂窝流量历史（§8）
+
+    /**
+     * 查询蜂窝流量用量。
+     * @param method `date-range` 按天返回数组；`mills-range` 返回区间总量字符串
+     */
+    suspend fun cellularUsage(startMs: Long, endMs: Long, method: String): JsonObject =
+        getJson("/api/cellularUsage?startTime=$startMs&endTime=$endMs&method=$method")
+
+    // ------------------------------------------------------------------ APN（§7）
+
+    suspend fun apnAll(): JsonObject = getJson("/api/apn/all")
+
+    suspend fun apnMode(): JsonObject = getJson("/api/apn/mode")
+
+    suspend fun setApnMode(mode: Int): String {
+        val o = postJson("/api/apn/mode", gson.toJson(mapOf("apn_mode" to mode)))
+        return if (o.isOk()) "success" else o.errMsg("切换 APN 模式失败")
+    }
+
+    suspend fun apnAuto(): JsonObject = getJson("/api/apn/auto")
+
+    suspend fun apnManual(): JsonObject = getJson("/api/apn/manual")
+
+    suspend fun addApnManual(params: Map<String, Any>): String {
+        val o = postJson("/api/apn/manual", gson.toJson(params))
+        return if (o.isOk()) "success" else o.errMsg("新增 APN 失败")
+    }
+
+    suspend fun updateApnManual(params: Map<String, Any>): String {
+        val o = putJson("/api/apn/manual", gson.toJson(params))
+        return if (o.isOk()) "success" else o.errMsg("修改 APN 失败")
+    }
+
+    suspend fun deleteApnManual(profileId: String): String {
+        val o = deleteJson("/api/apn/manual", gson.toJson(mapOf("profileId" to profileId)))
+        return if (o.isOk()) "success" else o.errMsg("删除 APN 失败")
+    }
+
+    suspend fun enableApnManual(profileId: String): String {
+        val o = postJson("/api/apn/manual/enable", gson.toJson(mapOf("profileId" to profileId)))
+        return if (o.isOk()) "success" else o.errMsg("启用 APN 失败")
+    }
+
+    suspend fun apnManualEnabled(): JsonObject = getJson("/api/apn/manual/enabled")
+
+    suspend fun apnCid(cid: Int): JsonObject = getJson("/api/apn/cid?cid=$cid")
+
+    // ------------------------------------------------------------------ 定时任务（§9）
+
+    suspend fun listTasks(): JsonObject = getJson("/api/list_tasks")
+
+    suspend fun getTask(id: String): JsonObject = getJson("/api/get_task?id=$id")
+
+    suspend fun addTask(json: String): String {
+        val o = postJson("/api/add_task", json)
+        return if (o.isOk()) "success" else o.errMsg("新增定时任务失败")
+    }
+
+    suspend fun removeTask(id: String): String {
+        val o = postJson("/api/remove_task", gson.toJson(mapOf("id" to id)))
+        val r = o.get("result")?.takeIf { !it.isJsonNull }?.asString ?: ""
+        return if (o.isOk() && r != "not_found") "success" else o.errMsg("删除定时任务失败")
+    }
+
+    suspend fun clearTasks(): String {
+        val o = postJson("/api/clear_task", "{}")
+        return if (o.isOk()) "success" else o.errMsg("清空定时任务失败")
+    }
+
+    // ------------------------------------------------------------------ WiFi 二维码（§10）
+
+    /** chip: 0=2.4G，1=5G。返回 PNG 字节，失败为 null */
+    suspend fun wifiQrcode(chip: Int): ByteArray? = getBytes("/api/wifi/qrcode?chip=$chip")
+
+    // ------------------------------------------------------------------ 上传管理（§11）
+
+    suspend fun uploadImage(file: File): JsonObject = upload("/api/upload_img", file)
+
+    suspend fun uploadFile(file: File, path: String = ""): JsonObject {
+        val extra = if (path.isBlank()) emptyMap() else mapOf("path" to path)
+        return upload("/api/upload_file", file, extraFields = extra)
+    }
+
+    suspend fun listUploads(): JsonObject = getJson("/api/list_uploads")
+
+    suspend fun deleteImage(fileName: String): String {
+        val o = postJson("/api/delete_img", gson.toJson(mapOf("file_name" to fileName)))
+        return if (o.isOk()) "success" else o.errMsg("删除文件失败")
+    }
+
+    suspend fun deleteAllUploads(): String {
+        val o = post("/api/delete_all_uploads_data")
+        return if (o.isOk()) "success" else o.errMsg("清空上传目录失败")
+    }
+
+    // ------------------------------------------------------------------ 主题 / 自定义头部（§12）
+
+    suspend fun getTheme(): JsonObject = getJson("/api/get_theme")
+
+    suspend fun setTheme(json: String): String {
+        val o = postJson("/api/set_theme", json)
+        return if (o.isOk()) "success" else o.errMsg("保存主题失败")
+    }
+
+    suspend fun getCustomHead(): JsonObject = getJson("/api/get_custom_head")
+
+    suspend fun setCustomHead(text: String): String {
+        val o = postJson("/api/set_custom_head", gson.toJson(mapOf("text" to text)))
+        return if (o.isOk()) "success" else o.errMsg("保存自定义头部失败")
+    }
+
+    // ------------------------------------------------------------------ 插件商店（§14）
+
+    suspend fun pluginsStore(): JsonObject = getJson("/api/plugins_store")
+
+    suspend fun pluginList(type: String = "", search: String = ""): JsonObject {
+        val q = buildString {
+            if (type.isNotBlank()) append("type=${URLEncoder.encode(type, "UTF-8")}&")
+            if (search.isNotBlank()) append("search=${URLEncoder.encode(search, "UTF-8")}")
+        }.trimEnd('&')
+        return getJson("/api/plugin/list" + if (q.isBlank()) "" else "?$q")
+    }
+
+    suspend fun pluginInstall(publicName: String, installDir: String = ""): String {
+        val o = postJson(
+            "/api/plugin/install",
+            gson.toJson(mapOf("public_name" to publicName, "install_dir" to installDir))
+        )
+        return if (o.isOk()) "success" else o.errMsg("安装插件失败")
+    }
+
+    suspend fun pluginUninstall(name: String): String {
+        val o = postJson("/api/plugin/uninstall", gson.toJson(mapOf("name" to name)))
+        return if (o.isOk()) "success" else o.errMsg("卸载插件失败")
+    }
+
+    suspend fun pluginNotifications(): JsonObject = getJson("/api/plugin/notifications")
+
+    suspend fun readPluginNotification(json: String = "{}"): String {
+        val o = postJson("/api/plugin/notification/read", json)
+        return if (o.isOk()) "success" else o.errMsg("标记通知已读失败")
+    }
+
+    suspend fun pluginUpdateCheck(): JsonObject = getJson("/api/plugin/update/check")
+
+    suspend fun pluginChangelog(): JsonObject = getJson("/api/plugin/changelog")
+
+    // ------------------------------------------------------------------ ttyd / ADB（§15）
+
+    suspend fun hasTtyd(port: Int = 1146): JsonObject = getJson("/api/hasTTYD?port=$port")
+
+    suspend fun ttydStatus(): JsonObject = getJson("/api/ttyd/status")
+
+    suspend fun ttydStart(port: Int = 1146): String {
+        val o = postJson("/api/ttyd/start", gson.toJson(mapOf("port" to port)))
+        return if (o.isOk()) "success" else o.errMsg("启动 ttyd 失败")
+    }
+
+    suspend fun ttydStop(): String {
+        val o = post("/api/ttyd/stop")
+        return if (o.isOk()) "success" else o.errMsg("停止 ttyd 失败")
+    }
+
+    suspend fun adbStatus(): JsonObject = getJson("/api/adb/status")
+
+    /** mode 取值如 `debug` / `normal`，见 API 文档 §15 */
+    suspend fun setAdbMode(mode: String): String {
+        val o = postJson("/api/adb/mode", gson.toJson(mapOf("mode" to mode)))
+        return if (o.isOk()) "success" else o.errMsg("切换 ADB 模式失败")
+    }
+
+    // ------------------------------------------------------------------ 后台管理（§3）
+
+    suspend fun updateAdminPwd(password: String): String {
+        val o = postJson("/api/update_admin_pwd", gson.toJson(mapOf("password" to password)))
+        return if (o.isOk()) "success" else o.errMsg("修改后台密码失败")
+    }
+
+    suspend fun getResServer(): JsonObject = getJson("/api/get_res_server")
+
+    suspend fun setResServer(url: String): String {
+        val o = postJson("/api/set_res_server", gson.toJson(mapOf("res_server" to url)))
+        return if (o.isOk()) "success" else o.errMsg("保存资源服务器失败")
+    }
 }

@@ -266,7 +266,12 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                 Spacer(Modifier.height(12.dp))
 
                 // 流量区：大数字 + 数据高亮色（对齐参考项目的 24sp 流量展示）
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { nav.navigate("usage") },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     FlowBlock(
                         label = "今日已用",
                         value = bytesToHuman(base?.num("daily_data")?.toLong()),
@@ -284,6 +289,12 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                         modifier = Modifier.weight(1f)
                     )
                 }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "点按查看流量历史 ›",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AppTheme.accent
+                )
             }
         }
 

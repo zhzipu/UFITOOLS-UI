@@ -36,6 +36,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.ufitools.client.model.SmsMessage
 import com.ufitools.client.ui.components.AppCard
+import com.ufitools.client.ui.components.OptionChip
 import com.ufitools.client.ui.components.SectionTitle
 import com.ufitools.client.ui.theme.AppTheme
 import com.ufitools.client.ui.theme.StatusBad
@@ -48,9 +49,26 @@ fun SmsScreen(vm: MainViewModel) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // 过滤与批量操作状态。
+    // 短信一多，平铺列表根本翻不动，所以加了「只看未读 / 按号码筛选 / 批量清零」这组能力。
+    var unreadOnly by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    var confirmDeleteAll by remember { mutableStateOf(false) }
+    var deletingAll by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) {
         vm.refreshSms()
     }
+
+    // 本地过滤：设备侧一条短信一次请求，批量删要逐条发，所以筛选放在本地做。
+    val shown = remember(vm.sms, unreadOnly, query) {
+        val q = query.trim()
+        vm.sms.filter { m ->
+            (!unreadOnly || m.isUnread) &&
+                (q.isEmpty() || m.number.contains(q) || m.decodedContent.contains(q, ignoreCase = true))
+        }
+    }
+    val unreadCount = vm.sms.count { it.isUnread }
 
     LazyColumn(
         Modifier
@@ -79,20 +97,67 @@ fun SmsScreen(vm: MainViewModel) {
         item {
             Spacer(Modifier.height(4.dp))
             SectionTitle(
-                "短信列表（未读 ${vm.smsUnread}）",
+                "短信列表（共 ${vm.sms.size} · 未读 $unreadCount）",
                 Modifier.padding(start = 4.dp, bottom = 8.dp)
             )
-        }
-
-        if (vm.sms.isEmpty()) {
-            item {
-                AppCard {
-                    Text("暂无短信", color = AppTheme.textSecondary)
+            AppCard {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = { Text("搜索号码或内容") },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AppTheme.accent,
+                        unfocusedBorderColor = AppTheme.textPrimary.copy(alpha = 0.15f),
+                        focusedLabelColor = AppTheme.accent,
+                        unfocusedLabelColor = AppTheme.textSecondary,
+                        cursorColor = AppTheme.accent,
+                        focusedTextColor = AppTheme.textPrimary,
+                        unfocusedTextColor = AppTheme.textPrimary
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OptionChip("只看未读", unreadOnly) { unreadOnly = !unreadOnly }
+                    if (query.isNotBlank()) {
+                        OptionChip("清除搜索", false) { query = "" }
+                    }
+                }
+                if (shown.isNotEmpty()) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(
+                            onClick = { confirmDeleteAll = true },
+                            enabled = !deletingAll
+                        ) {
+                            Text(
+                                if (deletingAll) "删除中…" else "删除当前 ${shown.size} 条",
+                                color = StatusBad
+                            )
+                        }
+                    }
                 }
             }
         }
 
-        items(vm.sms) { msg ->
+        if (shown.isEmpty()) {
+            item {
+                AppCard {
+                    Text(
+                        when {
+                            vm.sms.isEmpty() -> "暂无短信"
+                            else -> "没有匹配的短信"
+                        },
+                        color = AppTheme.textSecondary
+                    )
+                }
+            }
+        }
+
+        items(shown, key = { it.id }) { msg ->
             SmsItem(
                 msg,
                 onDelete = {
@@ -113,6 +178,39 @@ fun SmsScreen(vm: MainViewModel) {
         }
 
         item { Spacer(Modifier.height(24.dp)) }
+    }
+
+    if (confirmDeleteAll) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { confirmDeleteAll = false },
+            title = { Text("批量删除") },
+            text = { Text("将删除当前筛选出的 ${shown.size} 条短信，该操作不可撤销。") },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = {
+                    confirmDeleteAll = false
+                    deletingAll = true
+                    scope.launch {
+                        // 设备没有批量删除接口，逐条发；失败的记下来，最后如实汇报
+                        var ok = 0
+                        var fail = 0
+                        shown.forEach { m ->
+                            if (vm.deleteSms(m.id) == "success") ok++ else fail++
+                        }
+                        deletingAll = false
+                        vm.refreshSms()
+                        toast(
+                            context,
+                            if (fail == 0) "已删除 $ok 条" else "删除完成：成功 $ok，失败 $fail"
+                        )
+                    }
+                }) { Text("删除", color = StatusBad) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { confirmDeleteAll = false }) {
+                    Text("取消", color = AppTheme.textSecondary)
+                }
+            }
+        )
     }
 }
 

@@ -21,17 +21,24 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.CellTower
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.SimCard
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -60,7 +67,9 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufitools.client.BuildConfig
 import com.ufitools.client.data.RefreshInterval
+import com.ufitools.client.model.NetworkMode
 import com.ufitools.client.ui.components.AppCard
+import com.ufitools.client.ui.components.OptionChip
 import com.ufitools.client.ui.components.SectionTitle
 import com.ufitools.client.ui.components.StaggeredFadeIn
 import com.ufitools.client.ui.components.ThinDivider
@@ -79,6 +88,19 @@ private const val PROJECT_URL = "https://github.com/zhzipu/UFITOOLS-UI"
 
 /** 应用版本名，取自 BuildConfig（build.gradle.kts 的 versionName） */
 private val APP_VERSION: String = BuildConfig.VERSION_NAME
+
+/**
+ * SIM 卡槽可选值。
+ *
+ * 设备侧取值语义：`0` 自动、`1` 卡槽1、`2` 卡槽2、`11` 双卡同开。
+ * 之前是裸文本框，手输错了设备会静默忽略（goform 投递即成功），改点选可杜绝。
+ */
+private val SIM_SLOT_OPTIONS = listOf(
+    "0" to "自动",
+    "1" to "卡槽 1",
+    "2" to "卡槽 2",
+    "11" to "双卡同开",
+)
 
 @Composable
 fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
@@ -233,8 +255,15 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         onClick = { showDataLimit = true }
                     )
                     ThinDivider()
-                    SwitchItem("短信转发", vm.smsForward, Icons.Filled.Link) { on ->
-                        run("短信转发") { vm.setSmsForward(on) }
+                    ListRow(
+                        title = "短信转发",
+                        subtitle = if (vm.smsForward) "已开启 · 邮件/CURL/钉钉" else "未开启",
+                        icon = Icons.Filled.Link,
+                        onClick = { nav.navigate("sms-forward") }
+                    )
+                    ThinDivider()
+                    SwitchItem("短信转发开关", vm.smsForward, Icons.Filled.Link) { on ->
+                        run("短信转发") { vm.applySmsForward(on) }
                     }
                 }
             }
@@ -272,6 +301,23 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         run("WiFi") { vm.setWifi(on) }
                     }
                     ThinDivider()
+                    // 频段级开关：走 switchWiFiChip + ChipEnum（chip1=2.4G / chip2=5G），
+                    // 状态来自 queryAccessPointInfo，已随主轮询限流刷新
+                    SwitchItem("2.4G WiFi", vm.wifiBands.getOrNull(0) == true, Icons.Filled.Wifi) { on ->
+                        run("2.4G WiFi") { vm.setWifiBand(0, on) }
+                    }
+                    ThinDivider()
+                    SwitchItem("5G WiFi", vm.wifiBands.getOrNull(1) == true, Icons.Filled.Wifi) { on ->
+                        run("5G WiFi") { vm.setWifiBand(1, on) }
+                    }
+                    ThinDivider()
+                    ListRow(
+                        title = "WiFi 二维码",
+                        subtitle = "扫码连接 2.4G / 5G",
+                        icon = Icons.Filled.QrCode,
+                        onClick = { nav.navigate("wifi-qrcode") }
+                    )
+                    ThinDivider()
                     // 漫游读回以 dial_roam_setting_option 为准（官方 Web 端同此）
                     SwitchItem(
                         "数据漫游",
@@ -295,6 +341,73 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
 
         StaggeredFadeIn(4) { m ->
             Column(m.fillMaxWidth()) {
+                SectionTitle("数据与自动化", Modifier.padding(start = 4.dp, bottom = 8.dp))
+                AppCard(contentPadding = PaddingValues(0.dp)) {
+                    ListRow(
+                        title = "流量历史",
+                        subtitle = "按天查看蜂窝用量",
+                        icon = Icons.Filled.DataUsage,
+                        onClick = { nav.navigate("usage") }
+                    )
+                    ThinDivider()
+                    ListRow(
+                        title = "APN 管理",
+                        subtitle = "自动 / 自建接入点",
+                        icon = Icons.Filled.SettingsEthernet,
+                        onClick = { nav.navigate("apn") }
+                    )
+                    ThinDivider()
+                    ListRow(
+                        title = "定时任务",
+                        subtitle = "定时重启 / 开关 WiFi",
+                        icon = Icons.Filled.Schedule,
+                        onClick = { nav.navigate("tasks") }
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        StaggeredFadeIn(5) { m ->
+            Column(m.fillMaxWidth()) {
+                SectionTitle("扩展能力", Modifier.padding(start = 4.dp, bottom = 8.dp))
+                AppCard(contentPadding = PaddingValues(0.dp)) {
+                    ListRow(
+                        title = "文件管理",
+                        subtitle = "上传图片 / 文件到设备",
+                        icon = Icons.Filled.UploadFile,
+                        onClick = { nav.navigate("uploads") }
+                    )
+                    ThinDivider()
+                    ListRow(
+                        title = "插件商店",
+                        subtitle = "安装 / 卸载设备插件",
+                        icon = Icons.Filled.Extension,
+                        onClick = { nav.navigate("plugins") }
+                    )
+                    ThinDivider()
+                    ListRow(
+                        title = "终端与调试",
+                        subtitle = "网页终端 (ttyd) / ADB 模式",
+                        icon = Icons.Filled.Terminal,
+                        onClick = { nav.navigate("terminal") }
+                    )
+                    ThinDivider()
+                    ListRow(
+                        title = "设备高级设置",
+                        subtitle = "资源服务器 / 后台密码 / 自定义头部",
+                        icon = Icons.Filled.AdminPanelSettings,
+                        onClick = { nav.navigate("device-advanced") }
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        StaggeredFadeIn(6) { m ->
+            Column(m.fillMaxWidth()) {
                 SectionTitle("设备操作", Modifier.padding(start = 4.dp, bottom = 8.dp))
                 AppCard(contentPadding = PaddingValues(0.dp)) {
                     ListRow(
@@ -317,7 +430,7 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
 
         Spacer(Modifier.height(16.dp))
 
-        StaggeredFadeIn(5) { m ->
+        StaggeredFadeIn(7) { m ->
             Column(m.fillMaxWidth()) {
                 SectionTitle("调试", Modifier.padding(start = 4.dp, bottom = 8.dp))
                 AppCard(contentPadding = PaddingValues(0.dp)) {
@@ -333,7 +446,7 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
 
         Spacer(Modifier.height(16.dp))
 
-        StaggeredFadeIn(6) { m ->
+        StaggeredFadeIn(8) { m ->
             Column(m.fillMaxWidth()) {
                 SectionTitle("关于", Modifier.padding(start = 4.dp, bottom = 8.dp))
                 AppCard(contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp)) {
@@ -396,9 +509,15 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
         }, onDismiss = { showToken = false })
     }
     if (showNetworkMode) {
-        TextInputDialog("网络模式", live["net_select"] ?: "", "模式值（如 AUTO / ONLY_LTE / ONLY_5G）", onConfirm = { v ->
-            showNetworkMode = false; run("网络模式") { vm.setNetworkMode(v) }
-        }, onDismiss = { showNetworkMode = false })
+        OptionPickerDialog(
+            title = "网络模式",
+            options = NetworkMode.entries.map { it.value to it.label },
+            selected = live["net_select"] ?: "",
+            onSelect = { v ->
+                showNetworkMode = false; run("网络模式") { vm.setNetworkMode(v) }
+            },
+            onDismiss = { showNetworkMode = false }
+        )
     }
     if (showBandLock) {
         BandLockDialog(
@@ -412,6 +531,7 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
     }
     if (showCellLock) {
         CellLockDialog(
+            current = cellLockSummary(live),
             onLock = { pci, earfcn, rat ->
                 showCellLock = false; run("锁定基站") { vm.lockCell(pci, earfcn, rat) }
             },
@@ -428,9 +548,15 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
         )
     }
     if (showSimSlot) {
-        TextInputDialog("SIM 卡槽", live["sim_slot"] ?: "", "卡槽值（0/1/2/11）", onConfirm = { v ->
-            showSimSlot = false; run("切换卡槽") { vm.setSimSlot(v) }
-        }, onDismiss = { showSimSlot = false })
+        OptionPickerDialog(
+            title = "SIM 卡槽",
+            options = SIM_SLOT_OPTIONS,
+            selected = live["sim_slot"] ?: "",
+            onSelect = { v ->
+                showSimSlot = false; run("切换卡槽") { vm.setSimSlot(v) }
+            },
+            onDismiss = { showSimSlot = false }
+        )
     }
     if (showConfirmReboot) {
         ConfirmDialog(
@@ -565,7 +691,21 @@ private fun bandLockSummary(live: Map<String, String>): String {
 
 private fun cellLockSummary(live: Map<String, String>): String {
     val locked = live["locked_cell_info"]
-    return if (locked.isNullOrBlank()) "未锁定" else "已锁定"
+    if (locked.isNullOrBlank() || locked == "0" || locked == "{}") return "未锁定"
+    // 设备回读可能是 "pci,earfcn,rat" 或 JSON 对象，这里统一抽成一句能看懂的摘要。
+    // 之前只判断"有值就显示已锁定"，看不出到底锁在哪个小区，等于白锁。
+    val nums = Regex("\\d+").findAll(locked).map { it.value }.toList()
+    val rat = when {
+        locked.contains("NR", ignoreCase = true) -> "NR"
+        locked.contains("LTE", ignoreCase = true) -> "LTE"
+        else -> ""
+    }
+    return buildString {
+        if (rat.isNotEmpty()) append(rat).append(" · ")
+        if (nums.isNotEmpty()) append("PCI ").append(nums[0])
+        if (nums.size > 1) append(" · 频点 ").append(nums[1])
+        if (isEmpty()) append("已锁定")
+    }
 }
 
 @Composable
@@ -657,6 +797,7 @@ private fun BandLockDialog(
 
 @Composable
 private fun CellLockDialog(
+    current: String,
     onLock: (String, String, String) -> Unit,
     onUnlock: () -> Unit,
     onDismiss: () -> Unit
@@ -669,6 +810,17 @@ private fun CellLockDialog(
         title = { Text("锁定基站", color = AppTheme.textPrimary) },
         text = {
             Column {
+                // 已锁定时先把当前锁定的基站信息展示出来，避免"不知道现在锁在哪"。
+                // 设备回读字段 `locked_cell_info` 形如 "pci,earfcn,rat" 或 JSON，
+                // 统一由 cellLockSummary 归一成 "NR · PCI 123 · 频点 504990"。
+                if (current.isNotBlank()) {
+                    Text(
+                        "当前锁定：$current",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AppTheme.accent
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
                 OutlinedTextField(
                     value = pci,
                     onValueChange = { pci = it },
@@ -685,13 +837,15 @@ private fun CellLockDialog(
                     colors = dialogFieldColors()
                 )
                 Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = rat,
-                    onValueChange = { rat = it },
-                    label = { Text("制式（NR/LTE）") },
-                    singleLine = true,
-                    colors = dialogFieldColors()
-                )
+                // 制式由裸文本框改为选项：设备只认 NR/LTE 两个值，
+                // 手输错了设备会静默忽略（goform 投递即成功），选项化可以杜绝这类错。
+                Text("制式", style = MaterialTheme.typography.labelMedium, color = AppTheme.textSecondary)
+                Spacer(Modifier.height(6.dp))
+                Row {
+                    listOf("NR", "LTE").forEach { r ->
+                        OptionChip(r, rat == r) { rat = r }
+                    }
+                }
                 Spacer(Modifier.height(6.dp))
                 TextButton(onClick = onUnlock) { Text("解除锁定", color = StatusBad) }
             }
@@ -703,6 +857,43 @@ private fun CellLockDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消", color = AppTheme.textSecondary) }
+        },
+        containerColor = AppTheme.cardBg
+    )
+}
+
+/**
+ * 通用选项选择弹窗：把原先的裸文本框换成点选。
+ *
+ * @param options 值 → 显示名（显示名与值相同的可只传值名）
+ */
+@Composable
+private fun OptionPickerDialog(
+    title: String,
+    options: List<Pair<String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title, color = AppTheme.textPrimary) },
+        text = {
+            Column {
+                options.forEach { (value, label) ->
+                    val isSel = value == selected || value.equals(selected, ignoreCase = true)
+                    ListRow(
+                        title = label,
+                        subtitle = if (isSel) "当前：$value" else value,
+                        icon = if (isSel) Icons.Filled.CheckCircle else null,
+                        iconTint = AppTheme.accent,
+                        onClick = { onSelect(value) }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭", color = AppTheme.textSecondary) }
         },
         containerColor = AppTheme.cardBg
     )

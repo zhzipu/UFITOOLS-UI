@@ -37,14 +37,23 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.ufitools.client.ui.screens.ApnScreen
 import com.ufitools.client.ui.screens.AppearanceScreen
 import com.ufitools.client.ui.screens.AtCommandScreen
 import com.ufitools.client.ui.screens.ConnectionScreen
 import com.ufitools.client.ui.screens.DashboardScreen
+import com.ufitools.client.ui.screens.DeviceAdvancedScreen
 import com.ufitools.client.ui.screens.DeviceInfoScreen
+import com.ufitools.client.ui.screens.PluginStoreScreen
+import com.ufitools.client.ui.screens.ScheduledTaskScreen
 import com.ufitools.client.ui.screens.SettingsScreen
 import com.ufitools.client.ui.screens.SignalScreen
+import com.ufitools.client.ui.screens.SmsForwardScreen
 import com.ufitools.client.ui.screens.SmsScreen
+import com.ufitools.client.ui.screens.TerminalServiceScreen
+import com.ufitools.client.ui.screens.UploadManagerScreen
+import com.ufitools.client.ui.screens.UsageHistoryScreen
+import com.ufitools.client.ui.screens.WifiQrcodeScreen
 import com.ufitools.client.ui.theme.AppTheme
 import com.ufitools.client.ui.theme.UFIToolsTheme
 import com.ufitools.client.viewmodel.ConnectionStatus
@@ -134,6 +143,16 @@ fun App(vm: MainViewModel) {
             composable("settings") { SettingsScreen(vm, nav) }
             composable("appearance") { AppearanceScreen(vm, nav) }
             composable("at") { AtCommandScreen(vm, nav) }
+            // ---- API 文档对照新增的二级页面 ----
+            composable("apn") { ApnScreen(vm, nav) }
+            composable("usage") { UsageHistoryScreen(vm, nav) }
+            composable("tasks") { ScheduledTaskScreen(vm, nav) }
+            composable("wifi-qrcode") { WifiQrcodeScreen(vm, nav) }
+            composable("uploads") { UploadManagerScreen(vm, nav) }
+            composable("plugins") { PluginStoreScreen(vm, nav) }
+            composable("terminal") { TerminalServiceScreen(vm, nav) }
+            composable("sms-forward") { SmsForwardScreen(vm, nav) }
+            composable("device-advanced") { DeviceAdvancedScreen(vm, nav) }
         }
     }
 }
