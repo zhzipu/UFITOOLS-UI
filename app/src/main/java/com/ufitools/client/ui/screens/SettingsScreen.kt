@@ -1,5 +1,7 @@
 package com.ufitools.client.ui.screens
 
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -56,6 +58,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
+import com.ufitools.client.BuildConfig
 import com.ufitools.client.data.RefreshInterval
 import com.ufitools.client.ui.components.AppCard
 import com.ufitools.client.ui.components.SectionTitle
@@ -70,6 +73,12 @@ import kotlinx.coroutines.launch
 
 /** 开关拨动后等待设备回读的宽限时间；超时仍未生效即回滚到设备真实值 */
 private const val SWITCH_OPTIMISTIC_TIMEOUT_MS = 4_000L
+
+/** 开源仓库地址；"关于"卡片展示并作为跳转目标 */
+private const val PROJECT_URL = "https://github.com/zhzipu/UFITOOLS-UI"
+
+/** 应用版本名，取自 BuildConfig（build.gradle.kts 的 versionName） */
+private val APP_VERSION: String = BuildConfig.VERSION_NAME
 
 @Composable
 fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
@@ -318,6 +327,57 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         icon = Icons.Filled.Terminal,
                         onClick = { nav.navigate("at") }
                     )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        StaggeredFadeIn(6) { m ->
+            Column(m.fillMaxWidth()) {
+                SectionTitle("关于", Modifier.padding(start = 4.dp, bottom = 8.dp))
+                AppCard(contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp)) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text(
+                            "UFITOOLS-UI",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = AppTheme.textPrimary
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "版本 $APP_VERSION",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = AppTheme.textSecondary
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            PROJECT_URL,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = AppTheme.accent,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    // 设备可能没有浏览器，用 try/catch 兜底，避免崩溃
+                                    try {
+                                        context.startActivity(
+                                            Intent(
+                                                Intent.ACTION_VIEW,
+                                                Uri.parse(PROJECT_URL)
+                                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        )
+                                    } catch (e: Exception) {
+                                        toast("无法打开链接：" + e.message)
+                                    }
+                                }
+                                .padding(vertical = 4.dp)
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            "此项目免费，请勿上当受骗！",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = StatusBad
+                        )
+                    }
                 }
             }
         }

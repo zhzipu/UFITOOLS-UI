@@ -39,6 +39,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 设置页"关于"卡片需要读取 BuildConfig.VERSION_NAME
+        buildConfig = true
     }
 }
 
