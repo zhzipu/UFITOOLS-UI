@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.ufitools.client.BuildConfig
 import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
@@ -27,6 +28,7 @@ import com.ufitools.client.model.ScheduledTask
 import com.ufitools.client.model.SmsMessage
 import com.ufitools.client.model.StorePlugin
 import com.ufitools.client.model.UploadedFile
+import com.ufitools.client.model.UpdateInfo
 import com.ufitools.client.model.UsagePoint
 import com.ufitools.client.model.detectClientIcon
 import com.ufitools.client.model.kickClientCmd
@@ -37,6 +39,7 @@ import com.ufitools.client.network.ApiClient
 import com.ufitools.client.network.ApiException
 import com.ufitools.client.network.GoformClient
 import com.ufitools.client.network.UbusClient
+import com.ufitools.client.network.UpdateChecker
 import com.ufitools.client.ui.theme.ThemeMode
 import com.ufitools.client.widget.WidgetBus
 import com.ufitools.client.widget.WidgetSnapshot
@@ -132,6 +135,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val configStore = ConfigStore(app)
     private val themeStore = ThemeStore(app)
     private val clientIconStore = ClientIconStore(app)
+
+    /** 终端本地别名存储（设备侧无重命名接口，只能存在 App） */
+    private val clientNameStore = com.ufitools.client.data.ClientNameStore(app)
 
     private val api = ApiClient { config }
     private val goform = GoformClient { config }
@@ -301,6 +307,51 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         pageLoading = if (loading) pageLoading + page else pageLoading - page
     }
 
+    // ------------------------------------------------------------------ 应用自身更新（GitHub）
+
+    /** 当前安装的版本名，取自 BuildConfig（与 Release tag 同源） */
+    val appVersion: String = BuildConfig.VERSION_NAME
+
+    /** 更新检查结果：null = 尚未检查 / 检查失败 */
+    var updateInfo by mutableStateOf<UpdateInfo?>(null)
+        private set
+
+    /** 是否正在检查更新 */
+    var updateChecking by mutableStateOf(false)
+        private set
+
+    /** 启动时的自动检查只提示「有新版」，不打扰「已是最新/失败」 */
+    var updateDialogDismissed by mutableStateOf(false)
+
+    /**
+     * 检查 GitHub 上的新版本。
+     *
+     * @param silent 启动自动检查传 true：失败或已是最新都静默，只在发现新版时由界面弹窗；
+     *               用户在「关于」里手动点则传 false，会返回一句可 Toast 的结果。
+     * @return 一句面向用户的结果文案（silent 时也可能为空串）
+     */
+    suspend fun checkUpdate(silent: Boolean): String {
+        if (updateChecking) return ""
+        updateChecking = true
+        return try {
+            val info = UpdateChecker.check(appVersion)
+            updateInfo = info
+            when {
+                info == null ->
+                    if (silent) "" else "检查更新失败，请检查网络后重试"
+                info.hasUpdate -> {
+                    updateDialogDismissed = false
+                    "发现新版本 ${info.version}"
+                }
+                else -> if (silent) "" else "已是最新版本（$appVersion）"
+            }
+        } catch (e: Exception) {
+            if (silent) "" else "检查更新失败：${e.message ?: "未知错误"}"
+        } finally {
+            updateChecking = false
+        }
+    }
+
     /**
      * 记录/清除页面级错误。
      *
@@ -314,6 +365,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 终端自定义图标：MAC(小写) -> ClientIcon.key；无记录表示沿用自动识别 */
     private var clientIconOverrides by mutableStateOf(clientIconStore.loadAll())
+
+    /** 终端本地别名：MAC(小写) -> 别名；无记录表示沿用设备上报的 hostname */
+    private var clientNameOverrides by mutableStateOf(clientNameStore.loadAll())
 
     /** 最近一次成功刷新的时间（毫秒）；null 表示尚未成功刷新过 */
     var lastUpdated by mutableStateOf<Long?>(null)
@@ -493,6 +547,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             clientIconStore.save(mac, icon.key)
         }
         clientIconOverrides = clientIconStore.loadAll()
+    }
+
+    /**
+     * 该终端最终显示的名称：本地别名优先，否则用设备上报的 hostname。
+     *
+     * 设备**没有**重命名已连接终端的接口，别名只能存在 App 本地（按 MAC 关联），
+     * 见 [ClientNameStore]。
+     */
+    fun clientNameOf(c: ClientDevice): String =
+        clientNameOverrides[c.mac.trim().lowercase()]?.takeIf { it.isNotBlank() }
+            ?: c.displayName
+
+    /** 该终端已设的本地别名；**未设过返回空串**（区别于 [clientNameOf] 的回落邏辑） */
+    fun clientAliasOf(mac: String): String =
+        clientNameOverrides[mac.trim().lowercase()].orEmpty()
+
+    /** 设置本地别名；传空串表示恢复设备原名 */
+    fun setClientName(mac: String, name: String) {
+        clientNameStore.save(mac, name)
+        clientNameOverrides = clientNameStore.loadAll()
     }
 
     // ------------------------------------------------------------------ 字段清单
@@ -866,31 +940,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     suspend fun goformAction(goformId: String, params: Map<String, String>): String {
-        // 登录失败的两张脸：本服务(U60Pro) 返回 "1"、老 ZTE 固件返回 "3"。
-        // 之前只认 "3"，于是 "1" 会被当成成功、继续带着空 cookie 往下走，
-        // 最后报一个"操作失败(1)"之类的含糊结果——现在统一按登录失败处理。
-        var cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
-        var res = goform.post(goformId, params, cookie)
-        var r = res.get("result")?.asStringSafe() ?: ""
-        if (r == "1" || r == "3" || r.equals("failure", true)) {
-            goformCookie = null
-            cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
-            res = goform.post(goformId, params, cookie)
-            r = res.get("result")?.asStringSafe() ?: ""
-        }
-        return when {
-            isSuccess(res) -> "success"
-            // 重试后仍是这两个码：会话没拿到，根子还是后台密码
-            r == "1" || r == "3" -> LOGIN_FAILED_MSG
-            else -> res.get("error")?.asStringSafe() ?: "操作失败($r)"
+        // goform 是所有写操作的公共入口，这里兜住网络异常，
+        // 避免任一界面按钮因超时/断连把 App 带崩（见 safe 的说明）。
+        return try {
+            // 登录失败的两张脸：本服务(U60Pro) 返回 "1"、老 ZTE 固件返回 "3"。
+            // 之前只认 "3"，于是 "1" 会被当成成功、继续带着空 cookie 往下走，
+            // 最后报一个"操作失败(1)"之类的含糊结果——现在统一按登录失败处理。
+            var cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
+            var res = goform.post(goformId, params, cookie)
+            var r = res.get("result")?.asStringSafe() ?: ""
+            if (r == "1" || r == "3" || r.equals("failure", true)) {
+                goformCookie = null
+                cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
+                res = goform.post(goformId, params, cookie)
+                r = res.get("result")?.asStringSafe() ?: ""
+            }
+            when {
+                isSuccess(res) -> "success"
+                // 重试后仍是这两个码：会话没拿到，根子还是后台密码
+                r == "1" || r == "3" -> LOGIN_FAILED_MSG
+                else -> res.get("error")?.asStringSafe() ?: "操作失败($r)"
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            "操作失败：${e.message ?: "网络异常"}"
         }
     }
 
     // ------------------------------------------------------------------ 设置动作
 
-    suspend fun setNickname(nickname: String): String = api.setNickname(nickname)
+    suspend fun setNickname(nickname: String): String = safe {
+    api.setNickname(nickname)
+    }
 
-    suspend fun changeToken(newToken: String): String = api.setToken(newToken)
+    suspend fun changeToken(newToken: String): String = safe {
+    api.setToken(newToken)
+    }
 
     /**
      * 唤醒锁。
@@ -898,25 +984,37 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 设备**没有对应的读接口**（`/api/get_wakelock_status` 实测 404），开关状态无法回读，
      * 界面已移除入口。方法保留，以备后续找到可回读的来源后再接回界面。
      */
-    suspend fun setWakelock(enabled: Boolean): String = api.setWakelock(enabled)
+    suspend fun setWakelock(enabled: Boolean): String = safe {
+    api.setWakelock(enabled)
+    }
 
-    suspend fun setAdbWifi(enabled: Boolean, password: String): String = api.setAdbWifi(enabled, password)
+    suspend fun setAdbWifi(enabled: Boolean, password: String): String = safe {
+    api.setAdbWifi(enabled, password)
+    }
 
-    suspend fun setDataLimit(params: Map<String, Any>): String = api.setDataLimit(params)
+    suspend fun setDataLimit(params: Map<String, Any>): String = safe {
+    api.setDataLimit(params)
+    }
 
     /**
      * 开关短信转发。⚠️ 不叫 `setSmsForward`——`smsForward` 是公开 `var`，
      * 其自动生成的 setter 会与手写方法在 JVM 上撞名。命名约定见 [reportPageError]。
      */
-    suspend fun applySmsForward(enabled: Boolean): String = api.setSmsForwardEnabled(enabled)
+    suspend fun applySmsForward(enabled: Boolean): String = safe {
+    api.setSmsForwardEnabled(enabled)
+    }
 
     suspend fun volteStatus(): JsonObject = api.volteStatus()
 
     suspend fun vonrStatus(): JsonObject = api.vonrStatus()
 
-    suspend fun setVolte(enabled: Boolean): String = api.setVolte(enabled)
+    suspend fun setVolte(enabled: Boolean): String = safe {
+    api.setVolte(enabled)
+    }
 
-    suspend fun setVonr(enabled: Boolean): String = api.setVonr(enabled)
+    suspend fun setVonr(enabled: Boolean): String = safe {
+    api.setVonr(enabled)
+    }
 
     /**
      * 设置蜂窝网络模式优先级，取值见 [com.ufitools.client.model.NetworkMode]。
@@ -928,9 +1026,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 返回 `"success"` 表示已切到目标档位；其它为提示文案。
      */
-    suspend fun setBearerPreference(value: String): String =
-        setNetworkModeByUbus(value)
-            ?: goformAction("SET_BEARER_PREFERENCE", mapOf("BearerPreference" to value))
+    suspend fun setBearerPreference(value: String): String = safe {
+            setNetworkModeByUbus(value)
+                ?: goformAction("SET_BEARER_PREFERENCE", mapOf("BearerPreference" to value))
+    }
 
     /**
      * 经 ubus 切换网络模式。
@@ -963,11 +1062,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 官方 Web 端也没有这个入口，状态无从回读、写入也无从验证。界面已移除入口，
      * 方法保留以备后续在设备侧找到对应档位后再接回。
      */
-    suspend fun setPerformanceMode(on: Boolean): String =
-        goformAction("PERFORMANCE_MODE_SETTING", mapOf("performance_mode" to if (on) "1" else "0"))
+    suspend fun setPerformanceMode(on: Boolean): String = safe {
+            goformAction("PERFORMANCE_MODE_SETTING", mapOf("performance_mode" to if (on) "1" else "0"))
+    }
 
     /** 旧名保留，行为与 [setBearerPreference] 完全一致 */
-    suspend fun setNetworkMode(value: String): String = setBearerPreference(value)
+    suspend fun setNetworkMode(value: String): String = safe {
+    setBearerPreference(value)
+    }
 
     suspend fun setBandLock(lte: String, nr: String): String {
         var msg = "success"
@@ -980,10 +1082,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return msg
     }
 
-    suspend fun lockCell(pci: String, earfcn: String, rat: String): String =
-        goformAction("CELL_LOCK", mapOf("pci" to pci, "earfcn" to earfcn, "rat" to rat))
+    suspend fun lockCell(pci: String, earfcn: String, rat: String): String = safe {
+            goformAction("CELL_LOCK", mapOf("pci" to pci, "earfcn" to earfcn, "rat" to rat))
+    }
 
-    suspend fun unlockCell(): String = goformAction("UNLOCK_ALL_CELL", emptyMap())
+    suspend fun unlockCell(): String = safe {
+    goformAction("UNLOCK_ALL_CELL", emptyMap())
+    }
 
     /**
      * WiFi 开关。
@@ -1063,8 +1168,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 设备**不支持该设置**：goform 取不到 `indicator_light_switch` 字段，
      * 官方 Web 端也没有这个入口，状态无从回读。界面已移除入口，方法保留以备后用。
      */
-    suspend fun setIndicatorLight(on: Boolean): String =
-        goformAction("INDICATOR_LIGHT_SETTING", mapOf("indicator_light_switch" to if (on) "1" else "0"))
+    suspend fun setIndicatorLight(on: Boolean): String = safe {
+            goformAction("INDICATOR_LIGHT_SETTING", mapOf("indicator_light_switch" to if (on) "1" else "0"))
+    }
 
     /**
      * 数据漫游开关。
@@ -1085,41 +1191,71 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    suspend fun setSimSlot(slot: String): String =
-        goformAction("SET_SIM_SLOT", mapOf("sim_slot" to slot))
+    suspend fun setSimSlot(slot: String): String = safe {
+            goformAction("SET_SIM_SLOT", mapOf("sim_slot" to slot))
+    }
 
-    suspend fun setUsbNetworkProtocol(value: String): String =
-        goformAction("SET_USB_NETWORK_PROTOCAL", mapOf("usb_network_protocal" to value))
+    suspend fun setUsbNetworkProtocol(value: String): String = safe {
+            goformAction("SET_USB_NETWORK_PROTOCAL", mapOf("usb_network_protocal" to value))
+    }
 
-    suspend fun reboot(): String = goformAction("REBOOT_DEVICE", emptyMap())
+    suspend fun reboot(): String = safe {
+    goformAction("REBOOT_DEVICE", emptyMap())
+    }
 
-    suspend fun shutdown(): String = goformAction("SHUTDOWN_DEVICE", emptyMap())
+    suspend fun shutdown(): String = safe {
+    goformAction("SHUTDOWN_DEVICE", emptyMap())
+    }
 
     // ------------------------------------------------------------------ 短信
 
     suspend fun sendSms(number: String, content: String): String {
-        val cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
-        val res = goform.sendSms(number, content, cookie)
-        return if (isSuccess(res)) "success" else (res.get("error")?.asStringSafe() ?: "发送失败")
+        val cookie = try {
+            ensureCookie()
+        } catch (e: Exception) {
+            return "登录失败：${e.message ?: "网络异常"}"
+        } ?: return LOGIN_FAILED_MSG
+        return try {
+            val res = goform.sendSms(number, content, cookie)
+            if (isSuccess(res)) "success" else (res.get("error")?.asStringSafe() ?: "发送失败")
+        } catch (e: Exception) {
+            "发送失败：${e.message ?: "网络异常"}"
+        }
     }
 
     suspend fun deleteSms(msgId: String): String {
-        val cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
-        val res = goform.deleteSms(msgId, cookie)
-        return if (isSuccess(res)) "success" else "删除失败"
+        val cookie = try {
+            ensureCookie()
+        } catch (e: Exception) {
+            return "登录失败：${e.message ?: "网络异常"}"
+        } ?: return LOGIN_FAILED_MSG
+        return try {
+            val res = goform.deleteSms(msgId, cookie)
+            if (isSuccess(res)) "success" else "删除失败"
+        } catch (e: Exception) {
+            "删除失败：${e.message ?: "网络异常"}"
+        }
     }
 
     suspend fun markSmsRead(msgId: String): String {
-        val cookie = ensureCookie() ?: return LOGIN_FAILED_MSG
-        val res = goform.markSmsRead(msgId, cookie)
-        return if (isSuccess(res)) "success" else "标记失败"
+        val cookie = try {
+            ensureCookie()
+        } catch (e: Exception) {
+            return "登录失败：${e.message ?: "网络异常"}"
+        } ?: return LOGIN_FAILED_MSG
+        return try {
+            val res = goform.markSmsRead(msgId, cookie)
+            if (isSuccess(res)) "success" else "标记失败"
+        } catch (e: Exception) {
+            "标记失败：${e.message ?: "网络异常"}"
+        }
     }
 
     // ------------------------------------------------------------------ AT 命令
 
-    suspend fun atCommand(command: String): String {
+    suspend fun atCommand(command: String): String = safe {
         val o = api.atCommand(command)
-        return o.get("result")?.asStringSafe() ?: o.toString()
+        o.get("result")?.asStringSafe() ?: o.toString()
     }
 
     // ================================================================== 以下为 API 文档对照新增
@@ -1147,6 +1283,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 写操作包装：把网络异常转成可读提示，**绝不向上抛**。
+     *
+     * ⚠️ **为什么必须有这一层**：页面按钮普遍写成
+     * `scope.launch { toast(vm.xxx()) }`，而 `rememberCoroutineScope()` 的
+     * 异常会直接冒到线程默认处理器 —— 任何接口报错（404 / 401 / 超时）都会**闪退**。
+     * 实测踩过：选「转发方式」时接口返回 404，App 当场崩。
+     *
+     * 所以所有「会被界面按钮直接调用」的写方法都必须走这里，
+     * 返回 `"success"` 或一句人能看懂的错误。
+     */
+    private suspend fun safe(block: suspend () -> String): String = try {
+        block()
+    } catch (e: ApiException) {
+        e.message ?: "操作失败"
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e // 协程取消要原样抛出，否则会吞掉取消信号
+    } catch (e: Exception) {
+        "操作失败：${e.message ?: "未知错误"}"
+    }
+
     // ------------------------------------------------------------------ 短信转发完整配置（§6.3）
 
     suspend fun refreshSmsForwardConfig() {
@@ -1166,51 +1323,62 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun saveSmsForwardMethod(method: String): String = api.setSmsForwardMethod(method)
+    suspend fun saveSmsForwardMethod(method: String): String = safe {
+    api.setSmsForwardMethod(method)
+    }
 
-    suspend fun saveSmsForwardMail(cfg: SmsForwardConfig): String = api.setSmsForwardMail(
-        mapOf(
-            "smtp_host" to cfg.smtpHost,
-            "smtp_port" to cfg.smtpPort,
-            "smtp_to" to cfg.smtpTo,
-            "smtp_username" to cfg.smtpUsername,
-            "smtp_password" to cfg.smtpPassword,
-            "forward_dev_info" to if (cfg.mailForwardDevInfo) "1" else "0",
-        )
-    )
-
-    suspend fun saveSmsForwardCurl(cfg: SmsForwardConfig): String {
-        // 设备强校验 {{sms-body}} 占位符，缺了会静默不生效，这里提前拦下
-        if (!cfg.curlText.contains("{{sms-body}}")) return "CURL 模板必须包含 {{sms-body}} 占位符"
-        return api.setSmsForwardCurl(
+    suspend fun saveSmsForwardMail(cfg: SmsForwardConfig): String = safe {
+        api.setSmsForwardMail(
             mapOf(
-                "curl_text" to cfg.curlText,
-                "forward_dev_info" to if (cfg.curlForwardDevInfo) "1" else "0",
+                "smtp_host" to cfg.smtpHost,
+                "smtp_port" to cfg.smtpPort,
+                "smtp_to" to cfg.smtpTo,
+                "smtp_username" to cfg.smtpUsername,
+                "smtp_password" to cfg.smtpPassword,
+                "forward_dev_info" to if (cfg.mailForwardDevInfo) "1" else "0",
             )
         )
     }
 
-    suspend fun saveSmsForwardDingtalk(cfg: SmsForwardConfig): String = api.setSmsForwardDingtalk(
-        mapOf(
-            "webhook_url" to cfg.dingtalkWebhook,
-            "secret" to cfg.dingtalkSecret,
-            "forward_dev_info" to if (cfg.dingtalkForwardDevInfo) "1" else "0",
-        )
-    )
+    suspend fun saveSmsForwardCurl(cfg: SmsForwardConfig): String {
+        // 设备强校验 {{sms-body}} 占位符，缺了会静默不生效，这里提前拦下
+        if (!cfg.curlText.contains("{{sms-body}}")) return "CURL 模板必须包含 {{sms-body}} 占位符"
+        return safe {
+            api.setSmsForwardCurl(
+                mapOf(
+                    "curl_text" to cfg.curlText,
+                    "forward_dev_info" to if (cfg.curlForwardDevInfo) "1" else "0",
+                )
+            )
+        }
+    }
 
-    suspend fun saveSmsForwardBlacklist(cfg: SmsForwardConfig): String = api.setSmsForwardBlacklist(
-        mapOf(
-            "phone" to cfg.blacklistPhones,
-            "keywords" to cfg.blacklistKeywords,
+    suspend fun saveSmsForwardDingtalk(cfg: SmsForwardConfig): String = safe {
+        api.setSmsForwardDingtalk(
+            mapOf(
+                "webhook_url" to cfg.dingtalkWebhook,
+                "secret" to cfg.dingtalkSecret,
+                "forward_dev_info" to if (cfg.dingtalkForwardDevInfo) "1" else "0",
+            )
         )
-    )
+    }
+
+    suspend fun saveSmsForwardBlacklist(cfg: SmsForwardConfig): String = safe {
+        api.setSmsForwardBlacklist(
+            mapOf(
+                "phone" to cfg.blacklistPhones,
+                "keywords" to cfg.blacklistKeywords,
+            )
+        )
+    }
 
     /**
      * 开关电量转发。⚠️ 不叫 `setPowerForward`——`powerForward` 是公开 `var`，
      * 其自动生成的 setter 会与手写方法在 JVM 上撞名。命名约定见 [reportPageError]。
      */
-    suspend fun applyPowerForward(enabled: Boolean): String =
-        api.setPowerForwardEnabled(enabled).also { if (it == "success") powerForward = enabled }
+    suspend fun applyPowerForward(enabled: Boolean): String = safe {
+            api.setPowerForwardEnabled(enabled).also { if (it == "success") powerForward = enabled }
+    }
 
     // ------------------------------------------------------------------ 蜂窝流量历史（§8）
 
@@ -1260,16 +1428,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * ⚠️ 不叫 `setApnMode`——`apnMode` 是公开 `var`，其自动生成的 setter
      * 会与手写方法在 JVM 上撞名。命名约定见 [reportPageError]。
      */
-    suspend fun applyApnMode(mode: Int): String =
-        api.setApnMode(mode).also { if (it == "success") apnMode = mode }
+    suspend fun applyApnMode(mode: Int): String = safe {
+            api.setApnMode(mode).also { if (it == "success") apnMode = mode }
+    }
 
-    suspend fun addApn(p: ApnProfile): String = api.addApnManual(p.toBody())
+    suspend fun addApn(p: ApnProfile): String = safe {
+    api.addApnManual(p.toBody())
+    }
 
-    suspend fun updateApn(p: ApnProfile): String = api.updateApnManual(p.toBody())
+    suspend fun updateApn(p: ApnProfile): String = safe {
+    api.updateApnManual(p.toBody())
+    }
 
-    suspend fun deleteApn(profileId: String): String = api.deleteApnManual(profileId)
+    suspend fun deleteApn(profileId: String): String = safe {
+    api.deleteApnManual(profileId)
+    }
 
-    suspend fun enableApn(profileId: String): String = api.enableApnManual(profileId)
+    suspend fun enableApn(profileId: String): String = safe {
+    api.enableApnManual(profileId)
+    }
 
     // ------------------------------------------------------------------ 定时任务（§9）
 
@@ -1285,31 +1462,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 设备要求 `id` 唯一且非空，这里用时间戳生成；`action` 为自由 JSON，
      * 由调用方传入（界面只提供"重启"这类常用动作）。
      */
-    suspend fun addTask(time: String, repeatDaily: Boolean, actionJson: String): String {
+    suspend fun addTask(time: String, repeatDaily: Boolean, actionJson: String): String = safe {
         val body = JsonObject().apply {
             addProperty("id", System.currentTimeMillis().toString())
             addProperty("time", time)
             addProperty("repeatDaily", repeatDaily)
             add("action", com.google.gson.JsonParser.parseString(actionJson))
         }
-        return api.addTask(body.toString()).also { if (it == "success") refreshTasks() }
+        api.addTask(body.toString()).also { if (it == "success") refreshTasks() }
     }
 
-    suspend fun removeTask(id: String): String =
-        api.removeTask(id).also { if (it == "success") refreshTasks() }
+    suspend fun removeTask(id: String): String = safe {
+            api.removeTask(id).also { if (it == "success") refreshTasks() }
+    }
 
-    suspend fun clearTasks(): String =
-        api.clearTasks().also { if (it == "success") refreshTasks() }
+    suspend fun clearTasks(): String = safe {
+            api.clearTasks().also { if (it == "success") refreshTasks() }
+    }
 
     /** goform 计划重启（§5.2 `RESTART_SCHEDULE_SETTING`） */
-    suspend fun setRestartSchedule(enabled: Boolean, time: String): String =
-        goformAction(
-            "RESTART_SCHEDULE_SETTING",
-            mapOf(
-                "restart_schedule_switch" to if (enabled) "1" else "0",
-                "restart_time" to time,
+    suspend fun setRestartSchedule(enabled: Boolean, time: String): String = safe {
+            goformAction(
+                "RESTART_SCHEDULE_SETTING",
+                mapOf(
+                    "restart_schedule_switch" to if (enabled) "1" else "0",
+                    "restart_time" to time,
+                )
             )
-        )
+    }
 
     // ------------------------------------------------------------------ WiFi 二维码（§10）
 
@@ -1340,11 +1520,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun deleteUpload(name: String): String =
-        api.deleteImage(name).also { if (it == "success") refreshUploads() }
+    suspend fun deleteUpload(name: String): String = safe {
+            api.deleteImage(name).also { if (it == "success") refreshUploads() }
+    }
 
-    suspend fun deleteAllUploads(): String =
-        api.deleteAllUploads().also { if (it == "success") refreshUploads() }
+    suspend fun deleteAllUploads(): String = safe {
+            api.deleteAllUploads().also { if (it == "success") refreshUploads() }
+    }
 
     /** 上传文件的访问地址（免鉴权，可直接给系统浏览器/播放器） */
     fun uploadUrl(name: String): String = "${config.baseUrl}/api/uploads/$name"
@@ -1394,18 +1576,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun installPlugin(publicName: String): String =
-        api.pluginInstall(publicName).also { if (it == "success") refreshPlugins() }
+    suspend fun installPlugin(publicName: String): String = safe {
+            api.pluginInstall(publicName).also { if (it == "success") refreshPlugins() }
+    }
 
-    suspend fun uninstallPlugin(name: String): String =
-        api.pluginUninstall(name).also { if (it == "success") refreshPlugins() }
+    suspend fun uninstallPlugin(name: String): String = safe {
+            api.pluginUninstall(name).also { if (it == "success") refreshPlugins() }
+    }
 
-    suspend fun pluginUpdateCheck(): JsonObject = api.pluginUpdateCheck()
+    suspend fun pluginUpdateCheck(): JsonObject = page("pluginUpdate", JsonObject()) {
+        api.pluginUpdateCheck()
+    }
 
-    suspend fun pluginChangelog(): JsonObject = api.pluginChangelog()
+    suspend fun pluginChangelog(): JsonObject = page("pluginChangelog", JsonObject()) {
+        api.pluginChangelog()
+    }
 
-    suspend fun readPluginNotifications(): String =
-        api.readPluginNotification().also { if (it == "success") pluginNotifications = emptyList() }
+    suspend fun readPluginNotifications(): String = safe {
+            api.readPluginNotification().also { if (it == "success") pluginNotifications = emptyList() }
+    }
 
     // ------------------------------------------------------------------ ttyd / ADB（§15）
 
@@ -1421,11 +1610,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun startTtyd(port: Int = 1146): String =
-        api.ttydStart(port).also { if (it == "success") refreshTtyd() }
+    suspend fun startTtyd(port: Int = 1146): String = safe {
+            api.ttydStart(port).also { if (it == "success") refreshTtyd() }
+    }
 
-    suspend fun stopTtyd(): String =
-        api.ttydStop().also { if (it == "success") refreshTtyd() }
+    suspend fun stopTtyd(): String = safe {
+            api.ttydStop().also { if (it == "success") refreshTtyd() }
+    }
 
     /** ttyd 服务地址，供外部浏览器打开 */
     fun ttydUrl(port: Int = 1146): String = "http://${config.host}:$port"
@@ -1444,12 +1635,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun setAdbMode(mode: String): String =
-        api.setAdbMode(mode).also { if (it == "success") refreshAdbInfo() }
+    suspend fun setAdbMode(mode: String): String = safe {
+            api.setAdbMode(mode).also { if (it == "success") refreshAdbInfo() }
+    }
 
     // ------------------------------------------------------------------ 后台管理（§3）
 
-    suspend fun updateAdminPwd(password: String): String {
+    suspend fun updateAdminPwd(password: String): String = safe {
         val r = api.updateAdminPwd(password)
         // 改完密码，当前后台密码配置需要同步，否则后续 goform 写操作会全部失败
         if (r == "success") {
@@ -1457,7 +1649,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             configStore.save(config)
             goformCookie = null
         }
-        return r
+        r
     }
 
     suspend fun refreshResServer() {
@@ -1469,8 +1661,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun saveResServer(url: String): String =
-        api.setResServer(url).also { if (it == "success") resServer = url }
+    suspend fun saveResServer(url: String): String = safe {
+            api.setResServer(url).also { if (it == "success") resServer = url }
+    }
 
     suspend fun refreshCustomHead() {
         customHead = page("customHead", customHead) {
@@ -1478,8 +1671,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun saveCustomHead(text: String): String =
-        api.setCustomHead(text).also { if (it == "success") customHead = text }
+    suspend fun saveCustomHead(text: String): String = safe {
+            api.setCustomHead(text).also { if (it == "success") customHead = text }
+    }
 
     /** 弱口令检测（§3 `/api/is_weak_token`） */
     suspend fun refreshWeakToken() {
@@ -1520,6 +1714,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+        // 启动即静默检查更新（不依赖设备连接是否成功）——检查失败不打扰用户
+        viewModelScope.launch(Dispatchers.Main) { checkUpdate(silent = true) }
     }
 
     override fun onCleared() {

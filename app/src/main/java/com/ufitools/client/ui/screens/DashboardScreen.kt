@@ -64,6 +64,7 @@ import com.ufitools.client.model.uptimeHuman
 import com.ufitools.client.ui.components.AppCard
 import com.ufitools.client.ui.components.CarrierLogo
 import com.ufitools.client.ui.components.KeyValueRow
+import com.ufitools.client.ui.components.LabeledField
 import com.ufitools.client.ui.components.MetricCell
 import com.ufitools.client.ui.components.SectionTitle
 import com.ufitools.client.ui.components.SignalBars
@@ -365,6 +366,8 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
         // 数据来源：goform station_list（名称/IP/MAC/频段）+ run_shell 的 iw station dump（流量/连接时长）
         StaggeredFadeIn(2) { m ->
             var pickerFor by remember { mutableStateOf<ClientDevice?>(null) }
+            // 点某台设备的名称 → 终端详情弹窗（含本地别名编辑）
+            var detailFor by remember { mutableStateOf<ClientDevice?>(null) }
             // 踢出：待确认的终端 / 是否正在执行 / 结果提示
             var kickTarget by remember { mutableStateOf<ClientDevice?>(null) }
             var kicking by remember { mutableStateOf(false) }
@@ -398,6 +401,8 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                         ClientRow(
                             client = c,
                             icon = vm.clientIconOf(c),
+                            name = vm.clientNameOf(c),
+                            onNameClick = { detailFor = c },
                             onIconClick = { pickerFor = c },
                             onKickClick = { kickTarget = c }
                         )
@@ -443,7 +448,7 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                     title = { Text("踢出设备") },
                     text = {
                         Text(
-                            "将断开「${kick.displayName}」（${kick.mac}）的无线连接。\n\n" +
+                            "将断开「${vm.clientNameOf(kick)}」（${kick.mac}）的无线连接。\n\n" +
                                 "注意：对方如果仍保存着 WiFi 密码，通常会立刻自动重连。"
                         )
                     },
@@ -468,9 +473,9 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                                         it.mac.equals(kick.mac, ignoreCase = true)
                                     }
                                     kickMsg = if (still) {
-                                        "「${kick.displayName}」已断开，但可能又自动重连了"
+                                        "「${vm.clientNameOf(kick)}」已断开，但可能又自动重连了"
                                     } else {
-                                        "已踢出「${kick.displayName}」"
+                                        "已踢出「${vm.clientNameOf(kick)}」"
                                     }
                                 }
                             }
@@ -479,6 +484,17 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                     dismissButton = {
                         TextButton(onClick = { kickTarget = null }) { Text("取消") }
                     }
+                )
+            }
+
+            // 终端详情：点列表里的设备名称弹出
+            val detail = detailFor
+            if (detail != null) {
+                ClientDetailDialog(
+                    client = detail,
+                    alias = vm.clientAliasOf(detail.mac),
+                    onSaveName = { vm.setClientName(detail.mac, it) },
+                    onDismiss = { detailFor = null }
                 )
             }
         }
@@ -504,6 +520,100 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
         Spacer(Modifier.height(24.dp))
     }
 }
+
+/**
+ * 终端详情弹窗：在「设备列表」里点某台设备的**名称**弹出。
+ *
+ * 上半是只读信息（IP / MAC / 频段 / 信号 / 流量 / 连接时长 / 接口 / 厂商），
+ * 下半可改**名称**——设备固件没有重命名已连接终端的接口，所以这是**存在 App 本地的别名**
+ * （按 MAC 关联，见 `ClientNameStore`），清空即恢复设备上报的原名。
+ *
+ * @param alias 当前本地别名（空串表示还没设过）
+ */
+@Composable
+private fun ClientDetailDialog(
+    client: ClientDevice,
+    alias: String,
+    onSaveName: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var name by remember(client.mac) { mutableStateOf(alias) }
+    val hasAlias = alias.isNotBlank()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(18.dp),
+        containerColor = AppTheme.cardBg,
+        title = {
+            Text(
+                vmDisplayName(alias, client.hostname),
+                color = AppTheme.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                KeyValueRow("IP 地址", client.ip.ifBlank { "-" })
+                KeyValueRow("MAC 地址", client.mac.ifBlank { "-" })
+                if (client.bandLabel.isNotBlank()) KeyValueRow("频段", client.bandLabel)
+                if (client.iface != null) KeyValueRow("无线接口", client.iface)
+                KeyValueRow("信号强度", client.signalDbm?.let { "$it dBm" } ?: "有线 / 无数据")
+                KeyValueRow("上行流量", bytesToHuman(client.rxBytes))
+                KeyValueRow("下行流量", bytesToHuman(client.txBytes))
+                KeyValueRow("合计流量", client.usedText)
+                KeyValueRow("连接时长", client.connectedText)
+                if (client.vendor.isNotBlank()) KeyValueRow("厂商", client.vendor)
+                KeyValueRow("设备上报名", client.hostname.ifBlank { "（未上报）" })
+
+                Spacer(Modifier.height(12.dp))
+                ThinDivider()
+                Spacer(Modifier.height(12.dp))
+
+                SectionTitle("设备名称")
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "设备本身不支持给已连接终端改名，这里的名称保存在本机、按 MAC 关联。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppTheme.textSecondary
+                )
+                Spacer(Modifier.height(8.dp))
+                LabeledField(
+                    "名称",
+                    name,
+                    { name = it },
+                    placeholder = client.hostname.ifBlank { "未命名设备" }
+                )
+            }
+        },
+        confirmButton = {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                if (hasAlias) {
+                    TextButton(onClick = { onSaveName("") }) {
+                        Text("恢复原名", color = AppTheme.textSecondary)
+                    }
+                }
+                TextButton(
+                    onClick = { onSaveName(name.trim()) },
+                    enabled = name.trim() != alias
+                ) {
+                    Text("保存", color = AppTheme.accent)
+                }
+            }
+        }
+    )
+}
+
+/** 弹窗标题用：别名优先，否则设备上报名，都空则占位 */
+private fun vmDisplayName(alias: String, hostname: String): String =
+    alias.ifBlank { hostname }.ifBlank { "未命名设备" }
 
 @Composable
 private fun FlowBlock(label: String, value: String, modifier: Modifier = Modifier) {
@@ -575,6 +685,8 @@ private fun RefreshHint(vm: MainViewModel) {
 private fun ClientRow(
     client: ClientDevice,
     icon: ClientIcon,
+    name: String,
+    onNameClick: () -> Unit,
     onIconClick: () -> Unit,
     onKickClick: () -> Unit
 ) {
@@ -602,10 +714,14 @@ private fun ClientRow(
 
         Spacer(Modifier.width(12.dp))
 
-        Column(Modifier.weight(1f)) {
+        Column(
+            Modifier
+                .weight(1f)
+                .clickable(onClick = onNameClick)
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    client.displayName,
+                    name,
                     style = MaterialTheme.typography.bodyLarge,
                     color = AppTheme.textPrimary,
                     maxLines = 1,

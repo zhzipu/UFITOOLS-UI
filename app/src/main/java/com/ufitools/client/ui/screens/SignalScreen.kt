@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -15,9 +16,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CellTower
 import androidx.compose.material.icons.filled.SettingsEthernet
-import androidx.compose.material.icons.filled.SignalCellular4Bar
-import androidx.compose.material.icons.filled.SignalCellularAlt
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.SimCard
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -43,13 +45,12 @@ import com.ufitools.client.model.NetworkMode
 import com.ufitools.client.model.carrierLabel
 import com.ufitools.client.model.firstValidRsrp
 import com.ufitools.client.model.networkTypeLabel
-import com.ufitools.client.model.signalBarsOf
+import com.ufitools.client.model.SignalGrade
 import com.ufitools.client.ui.components.AppCard
 import com.ufitools.client.ui.components.CarrierLogo
 import com.ufitools.client.ui.components.KeyValueRow
 import com.ufitools.client.ui.components.MetricCell
 import com.ufitools.client.ui.components.SectionTitle
-import com.ufitools.client.ui.components.SignalBars
 import com.ufitools.client.ui.components.StaggeredFadeIn
 import com.ufitools.client.ui.components.ThinDivider
 import com.ufitools.client.ui.theme.AppTheme
@@ -71,8 +72,10 @@ fun SignalScreen(vm: MainViewModel) {
         ?: live["lte_rsrp"]?.takeIf { it.toDoubleOrNull() != 0.0 }
         ?: live["rssi"]
 
-    // 格数以 RSRP 为准（设备的 network_signalbar 在本固件恒为 5，只能兜底，见 signalBarsOf）
-    val signalBars = signalBarsOf(firstValidRsrp(rsrp), live["network_signalbar"])
+    // 信号评估等级：把「几格」换成人话（优秀/良好/一般/糟糕/不可用）。
+    // 阈值与 signalBarsOf 同源（-80/-90/-100/-110），见 model/SignalGrade.kt。
+    // 注：本页已不再显示格数，故不再计算 signalBars，避免留下死变量。
+    val grade = SignalGrade.from(firstValidRsrp(rsrp))
 
     var volteEnabled by remember { mutableStateOf<Boolean?>(null) }
     var vonrEnabled by remember { mutableStateOf<Boolean?>(null) }
@@ -119,7 +122,8 @@ fun SignalScreen(vm: MainViewModel) {
                             MetricItem(
                                 "网络制式",
                                 networkTypeLabel(live["network_type"]),
-                                icon = Icons.Filled.SignalCellularAlt
+                                // 基站塔图标：比通用的信号柱更能表达「网络指示」
+                                icon = Icons.Filled.CellTower
                             ),
                             MetricItem(
                                 "运营商",
@@ -136,13 +140,20 @@ fun SignalScreen(vm: MainViewModel) {
                                 "信号强度",
                                 rsrp?.let { "$it dBm" } ?: "",
                                 signalColor(rsrp),
-                                icon = Icons.Filled.SignalCellular4Bar
+                                // 仪表盘图标：表示「当前强度水平」。
+                                // 原来用 SignalCellular4Bar，与信号评估、以及底部「信号」Tab 的
+                                // 信号柱图标撞脸，换成轮廓完全不同的仪表盘。
+                                icon = Icons.Filled.Speed
                             ),
                             MetricItem(
-                                "信号格数",
-                                if (signalBars > 0) "$signalBars/5 格" else "",
-                                // 自绘信号柱，颜色跟随主题强调色（与仪表盘「信号类型」保持一致）
-                                iconSlot = { SignalBars(bars = signalBars, color = AppTheme.accent) }
+                                // 「格数」对用户没有意义，改成等级 + 配色：优秀/良好/一般/糟糕/不可用
+                                // （等级与配色由 model/SignalGrade.kt + gradeColor 决定）
+                                "信号评估",
+                                grade.label,
+                                gradeColor(grade),
+                                // 图标固定用「徽章」，**不随等级变色**，只跟随主题的图标色；
+                                // 强弱由右侧文字与文字颜色表达，避免同一格子里两条颜色通道打架。
+                                icon = Icons.Filled.Verified
                             ),
                             MetricItem(
                                 "拨号状态",
@@ -453,6 +464,21 @@ private fun signalColor(rsrp: String?): Color {
         v > -115 -> StatusWarn
         else -> StatusBad
     }
+}
+
+/**
+ * 信号评估等级 → 颜色。
+ *
+ * 五档各自一色，绿 → 蓝 → 琥珀 → 红 → 灰，从好到坏单调递减，扫一眼就能判断。
+ * 「不可用」用次要文字色，表示「没有可用信号」而不是「很差」。
+ */
+@Composable
+private fun gradeColor(g: SignalGrade): Color = when (g) {
+    SignalGrade.EXCELLENT -> StatusGood
+    SignalGrade.GOOD -> StatusInfo
+    SignalGrade.FAIR -> StatusWarn
+    SignalGrade.POOR -> StatusBad
+    SignalGrade.NONE -> AppTheme.textSecondary
 }
 
 private fun JsonObject.readEnabled(): Boolean? {

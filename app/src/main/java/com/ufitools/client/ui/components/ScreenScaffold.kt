@@ -193,6 +193,11 @@ fun LabeledField(
  * 的尾随 lambda 形式。若把 `enabled` 排在 `onClick` 之后，尾随 lambda 会被解析到
  * `enabled: Boolean` 上 → 编译报 “No value passed for parameter 'onClick'”。
  * 需要传 `enabled` 时用命名参数写在 lambda 前：`OptionChip("x", sel, enabled = f) { … }`。
+ *
+ * ⚠️ **选中态文字必须用 `Color.White`，不能用 `AppTheme.btnBg`**：
+ * `btnBg` 是「按钮**背景**色」，且 5 套浅色主题里 `accent == btnBg`（如默认主题两者都是
+ * `0xFF222222`）——拿它当文字色会变成「深色字压深色底」，字直接隐形。
+ * 与 `SignalScreen.ModeChip` 保持一致。
  */
 @Composable
 fun OptionChip(
@@ -202,8 +207,9 @@ fun OptionChip(
     enabled: Boolean = true,
     onClick: () -> Unit
 ) {
-    val bg = if (selected) AppTheme.accent else AppTheme.cardBg
-    val fg = if (selected) AppTheme.btnBg else AppTheme.textPrimary
+    // 未选中：卡片底 + 主文字色；选中：强调色底 + 白字（见上方 KDoc 的说明）
+    val bg = if (selected) AppTheme.accent else AppTheme.textPrimary.copy(alpha = 0.06f)
+    val fg = if (selected) Color.White else AppTheme.textPrimary
     Box(
         modifier
             .padding(end = 8.dp, bottom = 8.dp)

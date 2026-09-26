@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -73,6 +74,7 @@ import com.ufitools.client.ui.components.OptionChip
 import com.ufitools.client.ui.components.SectionTitle
 import com.ufitools.client.ui.components.StaggeredFadeIn
 import com.ufitools.client.ui.components.ThinDivider
+import com.ufitools.client.ui.components.openUrl
 import com.ufitools.client.ui.theme.AppTheme
 import com.ufitools.client.ui.theme.StatusBad
 import com.ufitools.client.ui.theme.ThemePalettes
@@ -261,10 +263,8 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         icon = Icons.Filled.Link,
                         onClick = { nav.navigate("sms-forward") }
                     )
-                    ThinDivider()
-                    SwitchItem("短信转发开关", vm.smsForward, Icons.Filled.Link) { on ->
-                        run("短信转发") { vm.applySmsForward(on) }
-                    }
+                    // 注：原来这里还有一个「短信转发开关」SwitchItem，与上面这行重复
+                    // （开关本身在「短信转发」详情页里已有），按反馈移除。
                 }
             }
         }
@@ -469,22 +469,62 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                             color = AppTheme.accent,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable {
-                                    // 设备可能没有浏览器，用 try/catch 兜底，避免崩溃
-                                    try {
-                                        context.startActivity(
-                                            Intent(
-                                                Intent.ACTION_VIEW,
-                                                Uri.parse(PROJECT_URL)
-                                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        )
-                                    } catch (e: Exception) {
-                                        toast("无法打开链接：" + e.message)
-                                    }
-                                }
+                                .clickable { openUrl(context, PROJECT_URL, "无法打开链接") }
                                 .padding(vertical = 4.dp)
                         )
                         Spacer(Modifier.height(10.dp))
+                        // ---- 检查更新（GitHub Release） ----
+                        ThinDivider()
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = !vm.updateChecking) {
+                                    scope.launch {
+                                        toast(vm.checkUpdate(silent = false))
+                                    }
+                                }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "检查更新",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = AppTheme.textPrimary
+                                )
+                                val tip = when {
+                                    vm.updateChecking -> "正在检查…"
+                                    vm.updateInfo == null -> "从 GitHub 获取最新版本"
+                                    vm.updateInfo!!.hasUpdate -> "发现新版本 ${vm.updateInfo!!.version}，点按下载"
+                                    else -> "已是最新版本"
+                                }
+                                Text(
+                                    tip,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (vm.updateInfo?.hasUpdate == true) AppTheme.accent
+                                    else AppTheme.textSecondary
+                                )
+                            }
+                            if (vm.updateChecking) {
+                                CircularProgressIndicator(
+                                    color = AppTheme.accent,
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            } else if (vm.updateInfo?.hasUpdate == true) {
+                                // 已发现新版：点一下直接去下载，不用等再检查一次
+                                TextButton(
+                                    onClick = {
+                                        val i = vm.updateInfo
+                                        if (i != null) openUrl(
+                                            context,
+                                            i.apkUrl ?: i.releaseUrl,
+                                            "无法打开下载链接"
+                                        )
+                                    }
+                                ) { Text("下载", color = AppTheme.accent) }
+                            }
+                        }
                         Text(
                             "此项目免费，请勿上当受骗！",
                             style = MaterialTheme.typography.bodyMedium,

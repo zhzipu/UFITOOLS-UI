@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -84,7 +85,7 @@ fun WifiQrcodeScreen(vm: MainViewModel, nav: NavHostController) {
             }
         }
 
-        AppCard(contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp)) {
+        AppCard(contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)) {
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -101,11 +102,14 @@ fun WifiQrcodeScreen(vm: MainViewModel, nav: NavHostController) {
                         modifier = Modifier.size(28.dp)
                     )
 
+                    // ⚠️ 必须 fillMaxSize()：只给 fillMaxWidth() 的话，Image 的高度会停在
+                    // 位图的固有高度上，ContentScale.Fit 于是把二维码缩进那个小高度里 ——
+                    // 表现就是「容器很大、二维码很小」（用户反馈）。填满容器才会真正放大。
                     bmp != null -> Image(
                         bitmap = bmp.asImageBitmap(),
                         contentDescription = "WiFi 二维码",
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxWidth().padding(12.dp)
+                        modifier = Modifier.fillMaxSize().padding(8.dp)
                     )
 
                     else -> EmptyHint(

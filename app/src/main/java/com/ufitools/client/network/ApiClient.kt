@@ -322,8 +322,18 @@ class ApiClient(private val configProvider: () -> DeviceConfig) {
 
     suspend fun smsForwardMethod(): JsonObject = getJson("/api/sms_forward_method")
 
+    /**
+     * 设置转发方式。
+     *
+     * ⚠️ 字段名以 **`sms_forward_method`** 为准（API 文档 §6.3：GET 返回
+     * `{"sms_forward_method":"SMTP"/"CURL"/"DINGTALK"}`）。文档没写 POST body 的字段名，
+     * 故**两个键都发**，兼容服务端任意一种取值方式。
+     */
     suspend fun setSmsForwardMethod(method: String): String {
-        val o = postJson("/api/sms_forward_method", gson.toJson(mapOf("method" to method)))
+        val o = postJson(
+            "/api/sms_forward_method",
+            gson.toJson(mapOf("sms_forward_method" to method, "method" to method))
+        )
         return if (o.isOk()) "success" else o.errMsg("设置转发方式失败")
     }
 
