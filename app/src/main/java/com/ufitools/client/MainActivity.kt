@@ -29,7 +29,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -57,8 +56,6 @@ import com.ufitools.client.ui.screens.UploadManagerScreen
 import com.ufitools.client.ui.screens.UsageHistoryScreen
 import com.ufitools.client.ui.screens.WebScreen
 import com.ufitools.client.ui.screens.WifiSettingsScreen
-import com.ufitools.client.ui.components.UpdateDialog
-import com.ufitools.client.ui.components.openUrl
 import com.ufitools.client.ui.theme.AppTheme
 import com.ufitools.client.ui.theme.UFIToolsTheme
 import com.ufitools.client.viewmodel.ConnectionStatus
@@ -106,22 +103,6 @@ private val tabs = listOf(
 fun App(vm: MainViewModel) {
     val nav = rememberNavController()
     val status = vm.status
-    val context = LocalContext.current
-
-    // 启动自动检查发现新版本 → 弹窗。独立于连接状态，任何界面都会提示。
-    val info = vm.updateInfo
-    if (info != null && info.hasUpdate && !vm.updateDialogDismissed) {
-        UpdateDialog(
-            info = info,
-            currentVersion = vm.appVersion,
-            onDismiss = { vm.updateDialogDismissed = true },
-            onDownload = {
-                // 优先给匹配本机 ABI 的 APK 直链；拿不到就开 Release 页让用户自选
-                openUrl(context, info.apkUrl ?: info.releaseUrl, "无法打开下载链接")
-                vm.updateDialogDismissed = true
-            }
-        )
-    }
 
     if (status !is ConnectionStatus.Connected) {
         // 上次成功登录过（vm 启动即自动连接）→ 这里显示过渡页，不要闪一下连接表单；

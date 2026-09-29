@@ -464,28 +464,16 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         }
                     }
 
-                    // 工具箱自身更新（GitHub Release），与设备固件 OTA 是两回事
+                    // 设备 UFI-TOOLS 软件更新：走网页版自带的更新功能（点它的 #OTA 入口），
+                    // 不再是「检查 App 自己在 GitHub 上的版本」。
                     ThinDivider()
                     ListRow(
-                        title = "UFITOOLS 更新",
-                        subtitle = when {
-                            vm.updateChecking -> "正在检查…"
-                            vm.updateInfo == null -> "从 GitHub 获取最新版本"
-                            vm.updateInfo!!.hasUpdate -> "发现新版本 ${vm.updateInfo!!.version}"
-                            else -> "已是最新版本 $APP_VERSION"
-                        },
+                        title = "UFI-TOOLS 更新",
+                        subtitle = "打开设备网页版的软件更新",
                         icon = Icons.Filled.UploadFile,
                         onClick = {
-                            val i = vm.updateInfo
-                            if (i?.hasUpdate == true) {
-                                openUrl(context, i.apkUrl ?: i.releaseUrl, "无法打开下载链接")
-                            } else {
-                                // checkUpdate 在"正在检查中"时会返回空串，直接 toast 会出现空气泡
-                                scope.launch {
-                                    val msg = vm.checkUpdate(silent = false)
-                                    if (msg.isNotBlank()) toast(msg)
-                                }
-                            }
+                            vm.webAutoAction = "softwareUpdate"
+                            nav.navigate("web")
                         }
                     )
                 }
@@ -640,58 +628,6 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                                 .padding(vertical = 4.dp)
                         )
                         Spacer(Modifier.height(10.dp))
-                        // ---- 检查更新（GitHub Release） ----
-                        ThinDivider()
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable(enabled = !vm.updateChecking) {
-                                    scope.launch {
-                                        toast(vm.checkUpdate(silent = false))
-                                    }
-                                }
-                                .padding(vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    "检查更新",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = AppTheme.textPrimary
-                                )
-                                val tip = when {
-                                    vm.updateChecking -> "正在检查…"
-                                    vm.updateInfo == null -> "从 GitHub 获取最新版本"
-                                    vm.updateInfo!!.hasUpdate -> "发现新版本 ${vm.updateInfo!!.version}，点按下载"
-                                    else -> "已是最新版本"
-                                }
-                                Text(
-                                    tip,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if (vm.updateInfo?.hasUpdate == true) AppTheme.accent
-                                    else AppTheme.textSecondary
-                                )
-                            }
-                            if (vm.updateChecking) {
-                                CircularProgressIndicator(
-                                    color = AppTheme.accent,
-                                    strokeWidth = 2.dp,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            } else if (vm.updateInfo?.hasUpdate == true) {
-                                // 已发现新版：点一下直接去下载，不用等再检查一次
-                                TextButton(
-                                    onClick = {
-                                        val i = vm.updateInfo
-                                        if (i != null) openUrl(
-                                            context,
-                                            i.apkUrl ?: i.releaseUrl,
-                                            "无法打开下载链接"
-                                        )
-                                    }
-                                ) { Text("下载", color = AppTheme.accent) }
-                            }
-                        }
                         Text(
                             "此项目免费，请勿上当受骗！",
                             style = MaterialTheme.typography.bodyMedium,

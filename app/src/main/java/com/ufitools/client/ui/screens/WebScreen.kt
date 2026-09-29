@@ -187,6 +187,32 @@ __CSSFIX__
 }
 
 /**
+ * 打开设备网页版「软件更新」的注入脚本。
+ *
+ * 网页版的更新入口是 `#OTA` 按钮（`initUpdateSoftware()` 给它绑了
+ * `onclick → checkUpdateAction()`，后者会打开 `#updateSoftwareModal` 并开始检查）。
+ * 而 `checkUpdateAction` 是模块作用域的 `const`，**不是 window 全局**，
+ * App 无法直接调用，只能模拟点击 `#OTA`。
+ *
+ * ⚠️ 必须**带重试**：注入可能发生在页面脚本跑完之前（`onPageStarted`），
+ * 那时 `#OTA` 的 onclick 还没绑、登录态也可能没就绪；这里每 250ms 轮询一次、
+ * 最多 24 次（约 6 秒），等按钮就绪再点。未登录时 `#OTA` 只会弹「请先登录」，
+ * 所以判定里同时要求两个登录键都在。
+ */
+private fun buildSoftwareUpdateJs(): String = """
+    (function () {
+      var tries = 0;
+      (function attempt() {
+        var pwd = localStorage.getItem('kano_sms_pwd');
+        var tok = localStorage.getItem('kano_sms_token');
+        var b = document.querySelector('#OTA');
+        if (pwd && tok && b) { b.click(); return; }
+        if (++tries < 24) setTimeout(attempt, 250);
+      })();
+    })();
+""".trimIndent()
+
+/**
  * 设备「网页版 UFI-TOOLS」的内嵌浏览器页面。
  *
  * ## 为什么内嵌而不是跳系统浏览器
@@ -295,6 +321,13 @@ fun WebScreen(
             // 只有确实改了 localStorage 才重载；已是同值就不必闪一下
             if (result != null && result.contains("changed")) {
                 view.reload()
+            } else if (!failed) {
+                // 注入完成且本帧无需 reload：登录态已就绪、页面脚本已跑完，
+                // 这时才执行待办动作 —— 若放在 changed/reload 那帧，动作会被重载丢掉
+                if (vm.webAutoAction != null) {
+                    vm.webAutoAction = null
+                    view.evaluateJavascript(buildSoftwareUpdateJs(), null)
+                }
             }
         }
     }

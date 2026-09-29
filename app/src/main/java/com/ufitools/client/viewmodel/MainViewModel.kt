@@ -1,14 +1,11 @@
 package com.ufitools.client.viewmodel
 
 import android.app.Application
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.ufitools.client.BuildConfig
 import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
@@ -49,7 +46,6 @@ import com.ufitools.client.model.ScheduledTask
 import com.ufitools.client.model.SmsMessage
 import com.ufitools.client.model.StorePlugin
 import com.ufitools.client.model.UploadedFile
-import com.ufitools.client.model.UpdateInfo
 import com.ufitools.client.model.UsagePoint
 import com.ufitools.client.model.WifiAp
 import com.ufitools.client.model.ClashProbe
@@ -75,7 +71,6 @@ import com.ufitools.client.network.Crypto
 import com.ufitools.client.network.GoformClient
 import com.ufitools.client.network.NfcState
 import com.ufitools.client.network.UbusClient
-import com.ufitools.client.network.UpdateChecker
 import com.ufitools.client.ui.theme.ThemePalettes
 import com.ufitools.client.ui.theme.ThemeMode
 import com.ufitools.client.widget.WidgetBus
@@ -482,95 +477,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun markLoading(page: String, loading: Boolean) {
         pageLoading = if (loading) pageLoading + page else pageLoading - page
-    }
-
-    // ------------------------------------------------------------------ 应用自身更新（GitHub）
-
-    /** 当前安装的版本名，取自 BuildConfig（与 Release tag 同源） */
-    val appVersion: String = BuildConfig.VERSION_NAME
-
-    /** 更新检查结果：null = 尚未检查 / 检查失败 */
-    var updateInfo by mutableStateOf<UpdateInfo?>(null)
-        private set
-
-    /** 是否正在检查更新 */
-    var updateChecking by mutableStateOf(false)
-        private set
-
-    /** 启动时的自动检查只提示「有新版」，不打扰「已是最新/失败」 */
-    var updateDialogDismissed by mutableStateOf(false)
-
-    /**
-     * 检查 GitHub 上的新版本。
-     *
-     * ⚠️ **冷启动时必须先等网络就绪**：App 刚起来时 Android 的网络栈 / DNS
-     * 往往还没建立完，此时直接请求 `api.github.com` 必然解析失败或超时 ——
-     * 表现就是"刚进 App 检查更新总失败，过几分钟又正常"（[awaitNetworkReady]）。
-     *
-     * @param silent 启动自动检查传 true：失败或已是最新都静默，只在发现新版时由界面弹窗；
-     *               用户在「关于」里手动点则传 false，会返回一句可 Toast 的结果。
-     * @return 一句面向用户的结果文案（silent 时也可能为空串）
-     */
-    suspend fun checkUpdate(silent: Boolean): String {
-        if (updateChecking) return ""
-        updateChecking = true
-        return try {
-            if (!awaitNetworkReady()) {
-                return if (silent) "" else "当前无网络连接，请检查网络后重试"
-            }
-            // 网络刚就绪的一瞬间 DNS 可能还没生效，失败就补一次再下结论
-            var info = UpdateChecker.check(appVersion)
-            if (info == null) {
-                delay(UPDATE_RETRY_DELAY_MS)
-                info = UpdateChecker.check(appVersion)
-            }
-            updateInfo = info
-            when {
-                // 失败时把 [UpdateChecker.lastError] 一并带出来（如 DNS 解析失败 / HTTP 403）——
-                // 只说"检查失败"没法判断该改网络还是等一会儿再试
-                info == null -> if (silent) "" else
-                    "检查更新失败：${UpdateChecker.lastError ?: "未知原因"}"
-                info.hasUpdate -> {
-                    updateDialogDismissed = false
-                    "发现新版本 ${info.version}"
-                }
-                else -> if (silent) "" else "已是最新版本（$appVersion）"
-            }
-        } catch (e: Exception) {
-            if (silent) "" else "检查更新失败：${e.message ?: "未知错误"}"
-        } finally {
-            updateChecking = false
-        }
-    }
-
-    /**
-     * 等待系统报告「网络可用」，最多等 [NETWORK_WAIT_TIMEOUT_MS]。
-     *
-     * 存在的意义就是修掉「冷启动检查更新必失败」：进程刚起来那几秒，
-     * `ConnectivityManager` 还没给出带 `NET_CAPABILITY_INTERNET` 的网络，
-     * 这时发出去的请求会以 `UnknownHostException` / 超时告终。
-     * 先等它就绪，可以免掉那次注定失败的尝试。
-     *
-     * 判据只用 `NET_CAPABILITY_INTERNET` 而**不加 `NET_CAPABILITY_VALIDATED`**：
-     * 后者要等系统完成一次真实连通性探测，冷启动时会慢很多；
-     * 这里宁可"早放行 + 靠调用方重试兜底"，也不要让用户干等。
-     *
-     * @return true = 已有可用网络；false = 超时（大概率真的没网）
-     */
-    private suspend fun awaitNetworkReady(): Boolean {
-        val cm = getApplication<Application>()
-            .getSystemService(ConnectivityManager::class.java)
-            // 拿不到服务时不要阻塞功能，直接放行让请求自己去撞
-            ?: return true
-        val deadline = System.currentTimeMillis() + NETWORK_WAIT_TIMEOUT_MS
-        while (System.currentTimeMillis() < deadline) {
-            val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-            if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true) {
-                return true
-            }
-            delay(NETWORK_POLL_INTERVAL_MS)
-        }
-        return false
     }
 
     /**
@@ -1812,25 +1718,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val WIDGET_PUSH_MIN_INTERVAL_MS = 10_000L
 
         /**
-         * 检查更新前，等待「网络可用」的最长时间。
-         *
-         * 冷启动时网络栈/DNS 就绪通常只要 1~3 秒，8 秒足够覆盖；
-         * 超过这个时间基本可以判定是真的没网，没必要继续等。
-         */
-        private const val NETWORK_WAIT_TIMEOUT_MS = 8_000L
-
-        /** 等待网络时的轮询间隔 */
-        private const val NETWORK_POLL_INTERVAL_MS = 300L
-
-        /**
-         * 检查更新首次失败后的补试间隔。
-         *
-         * 网络刚就绪的一瞬间 DNS 可能还没生效，隔 1.2 秒再问一次能显著提高成功率，
-         * 又不会让手动点击的用户等太久。
-         */
-        private const val UPDATE_RETRY_DELAY_MS = 1_200L
-
-        /**
          * 短信转发开关的最小刷新间隔。
          *
          * 它走 `/api/sms_forward_enabled`（goform 没有这个字段），请求很轻，
@@ -2933,6 +2820,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun webUiUrl(): String = config.baseUrl
 
     /**
+     * 进入网页版后要自动触发的动作（一次性），由 [com.ufitools.client.ui.screens.WebScreen]
+     * 在页面加载完成后执行并置回 null。当前只有：
+     * - `"softwareUpdate"` —— 打开设备网页版 UFI-TOOLS 自带的「软件更新」弹窗
+     *   （点 `#OTA` 按钮，等价于网页端的「软件更新」入口）。
+     */
+    var webAutoAction by mutableStateOf<String?>(null)
+
+    /**
      * 网页版自动登录是否已经尝试过。
      *
      * ⚠️ 这个标志是**故意跨页面实例保持**的（放在 ViewModel 而不是 WebScreen 的
@@ -3077,8 +2972,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
-        // 启动即静默检查更新（不依赖设备连接是否成功）——检查失败不打扰用户
-        viewModelScope.launch(Dispatchers.Main) { checkUpdate(silent = true) }
     }
 
     override fun onCleared() {
