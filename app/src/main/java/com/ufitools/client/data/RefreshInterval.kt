@@ -16,8 +16,8 @@ enum class RefreshInterval(val millis: Long, val label: String) {
     val enabled: Boolean get() = millis > 0
 
     companion object {
-        /** 默认 10 秒，兼顾实时性与设备负载。 */
-        val DEFAULT = NORMAL
+        /** 默认 1 秒，仪表盘数据尽量接近实时。 */
+        val DEFAULT = REALTIME
 
         fun byName(name: String?): RefreshInterval =
             entries.firstOrNull { it.name == name } ?: DEFAULT
