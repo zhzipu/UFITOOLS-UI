@@ -628,6 +628,58 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                                 .padding(vertical = 4.dp)
                         )
                         Spacer(Modifier.height(10.dp))
+                        // ---- 检查更新（GitHub Release） ----
+                        ThinDivider()
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = !vm.updateChecking) {
+                                    scope.launch {
+                                        toast(vm.checkUpdate(silent = false))
+                                    }
+                                }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "检查更新",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = AppTheme.textPrimary
+                                )
+                                val tip = when {
+                                    vm.updateChecking -> "正在检查…"
+                                    vm.updateInfo == null -> "从 GitHub 获取最新版本"
+                                    vm.updateInfo!!.hasUpdate -> "发现新版本 ${vm.updateInfo!!.version}，点按下载"
+                                    else -> "已是最新版本"
+                                }
+                                Text(
+                                    tip,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (vm.updateInfo?.hasUpdate == true) AppTheme.accent
+                                    else AppTheme.textSecondary
+                                )
+                            }
+                            if (vm.updateChecking) {
+                                CircularProgressIndicator(
+                                    color = AppTheme.accent,
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            } else if (vm.updateInfo?.hasUpdate == true) {
+                                // 已发现新版：点一下直接去下载，不用等再检查一次
+                                TextButton(
+                                    onClick = {
+                                        val i = vm.updateInfo
+                                        if (i != null) openUrl(
+                                            context,
+                                            i.apkUrl ?: i.releaseUrl,
+                                            "无法打开下载链接"
+                                        )
+                                    }
+                                ) { Text("下载", color = AppTheme.accent) }
+                            }
+                        }
                         Text(
                             "此项目免费，请勿上当受骗！",
                             style = MaterialTheme.typography.bodyMedium,
