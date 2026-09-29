@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -22,13 +23,17 @@ import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BatteryFull
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.DeveloperBoard
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Power
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -45,6 +50,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -139,6 +145,29 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
     val deviceIp = live["lan_ipaddr"]?.takeIf { it.isNotBlank() } ?: vm.config.host
     val clientIp = base?.s("client_ip")?.takeIf { it.isNotBlank() }
 
+    // 「i」按钮弹出的设备信息面板
+    var showDeviceInfo by remember { mutableStateOf(false) }
+
+    // ── 设备列表（`StaggeredFadeIn(2)` 那块）要用的弹窗状态 ──
+    // 刻意提到函数顶层：见下方 Box 处的说明，弹窗不能挂在会随数据变化的条件分支里。
+    var pickerFor by remember { mutableStateOf<ClientDevice?>(null) }
+    // 点某台设备的名称 → 终端详情弹窗（含本地别名编辑）
+    var detailFor by remember { mutableStateOf<ClientDevice?>(null) }
+    // 拉黑：待确认的终端 / 是否正在执行 / 结果提示
+    var blockTarget by remember { mutableStateOf<ClientDevice?>(null) }
+    var blocking by remember { mutableStateOf(false) }
+    var blockMsg by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    // ⚠️ 所有 Dialog 都必须写在下面这个 Column **之外**（本文件里统一放在 Column 后面）。
+    //
+    // 以前它们是 Column 的兄弟项（`if (xxx) Dialog(...)` 直接写在 Column 花括号里），
+    // 结果点「i」弹窗时：Column 的子项个数发生变化 → 后续所有卡片的槽位整体后移，
+    // Compose 只好丢弃并重建它们的 remember 状态（`StaggeredFadeIn` 的 alpha、
+    // 各卡片内部状态全部归零）→ 视觉上就是"整页卡片抽了一下"。
+    //
+    // Dialog 本身渲染在独立 Window 里，本来就不占 Column 的位置，放在外面毫无副作用。
+    Box(Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -153,12 +182,54 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(Modifier.weight(1f)) {
-                Text(
-                    model.ifBlank { "未知设备" },
-                    style = MaterialTheme.typography.displaySmall,
-                    color = AppTheme.dataHighlight,
-                    maxLines = 1
-                )
+                // 标题行：「U60Pro」+ 紧贴其右的「i」角标。
+                // 「i」刻意不放到整行最右侧——那里是刷新按钮的地盘，
+                // 两个图标并排会让人以为是同一组操作。贴标题才是「关于这台设备」的语义。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        model.ifBlank { "未知设备" },
+                        style = MaterialTheme.typography.displaySmall,
+                        color = AppTheme.dataHighlight,
+                        maxLines = 1,
+                        // 型号超长时让标题先让位（「i」始终可见），尾随省略号收尾
+                        overflow = TextOverflow.Ellipsis,
+                        // 点标题 → 进入设备上的「网页版 UFI-TOOLS」。
+                        //
+                        // 网页版与 App 走的是同一个服务、同一个端口（ufi-tools-u60pro
+                        // 监听 :2333，既给 App 的 /api/ 接口，也直接吐网页），所以点型号
+                        // 直接进去是最自然的入口，比让用户手输地址省事得多。
+                        //
+                        // 走 App **内嵌 WebView**（"web" 路由）而不是系统浏览器：
+                        // 网页版本质是这台设备的一个界面，内嵌能保持连贯体验——
+                        // 返回键直接回仪表盘、登录态与 App 同域共享，
+                        // 而不是跳出去再重新登录一遍。
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .clickable { nav.navigate("web") }
+                    )
+                    IconButton(
+                        onClick = { showDeviceInfo = true },
+                        // 默认 IconButton 是 48dp 触控区，塞在标题旁会把行高撑开、
+                        // 视觉上也显得比标题还大。收到 28dp：仍够手指点，又不喧宾夺主。
+                        //
+                        // `offset(y = -8.dp)` 是纯粹的视觉微调：大标题走 displaySmall，
+                        // 行高比这个小图标高得多，Row 的 CenterVertically 对齐会把「i」按
+                        // 字形盒居中，看起来比标题基线偏低。往上顶 8dp 让它的视觉中心
+                        // 与标题字面（x-height 区域）对齐。offset 只挪绘制位置、
+                        // **不改变父级测量**，所以不会影响标题的 weight 分配。
+                        modifier = Modifier
+                            .padding(start = 6.dp)
+                            .offset(y = (-8).dp)
+                            .size(28.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Info,
+                            contentDescription = "设备信息",
+                            tint = AppTheme.textMuted,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
                 Text(
                     buildString {
                         append(netType)
@@ -185,7 +256,11 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                 }
                 Spacer(Modifier.height(10.dp))
 
-                // ── 第一行：运营商 + 信号类型（对齐参考项目的网络信息位） ──
+                // ── 第一行：运营商 + 信号类型 + QCI 等级 + 合约速率 ──
+                //
+                // 四格挤在一行：横屏平板上每格约 90~100dp，够放下两三个汉字 +
+                // 一个 3 位数。营运商/信号类型的信息密度低，让它们与后面的
+                // QoS 指标（QCI、合约速率）共处一行，比另起一行省一档纵向空间。
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     MetricCell(
                         label = "运营商",
@@ -206,6 +281,31 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                         // 图标随格数变化：5 根柱子按当前信号格数点亮（见 components/SignalBars）。
                         // 颜色取当前主题的强调色，跟着配色/明暗切换走。
                         iconSlot = { SignalBars(bars = signalBars, color = AppTheme.accent) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    MetricCell(
+                        label = "QCI 等级",
+                        // goform `qci` 直接给数字（如 "8"），未登录也能读。
+                        // 取不到就回 "-"，不编造默认值——QCI 因业务承载而异（1/5/8/9…），猜错会误导。
+                        value = qciText(vm),
+                        // QCI 越大优先级越低：1~5 是信令/语音类高优先级承载，
+                        // 6~9 是普通数据。用颜色把"是否高优先级"一眼分开。
+                        valueColor = qciColor(vm),
+                        icon = Icons.Filled.Speed,
+                        modifier = Modifier.weight(1f)
+                    )
+                    MetricCell(
+                        label = "合约速率",
+                        // 一格承载上下行两个值：主行放下行，副行放上行。
+                        // 合约速率（AMBR）是运营商签约的速率上限，上下行成对出现才有意义，
+                        // 拆成两格会把"下行是多少"和"上行是多少"割裂开、也不好与设备后台对照。
+                        //
+                        // 字段名是 `ambr_dl_max` / `ambr_ul_max`（**带 `_max` 后缀**，单位 Mbps），
+                        // 与 QCI 同属 goform 轮询字段、未登录即可批量读取。
+                        // ⚠️ 不带后缀的 `ambr` / `ambr_dl` / `ambr_ul` 实测全返回空 `{}`。
+                        value = ambrText(vm.live["ambr_dl_max"], "↓"),
+                        sub = "↑ " + ambrText(vm.live["ambr_ul_max"]),
+                        icon = Icons.Filled.DataUsage,
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -365,14 +465,8 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
         // ── 已连接设备列表卡片 ──
         // 数据来源：goform station_list（名称/IP/MAC/频段）+ run_shell 的 iw station dump（流量/连接时长）
         StaggeredFadeIn(2) { m ->
-            var pickerFor by remember { mutableStateOf<ClientDevice?>(null) }
-            // 点某台设备的名称 → 终端详情弹窗（含本地别名编辑）
-            var detailFor by remember { mutableStateOf<ClientDevice?>(null) }
-            // 踢出：待确认的终端 / 是否正在执行 / 结果提示
-            var kickTarget by remember { mutableStateOf<ClientDevice?>(null) }
-            var kicking by remember { mutableStateOf(false) }
-            var kickMsg by remember { mutableStateOf<String?>(null) }
-            val scope = rememberCoroutineScope()
+            // 进页面时读一次黑名单，才能把已在黑名单里的设备标出来
+            LaunchedEffect(Unit) { vm.refreshBlacklist() }
 
             AppCard(m) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -402,19 +496,20 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                             client = c,
                             icon = vm.clientIconOf(c),
                             name = vm.clientNameOf(c),
+                            blocked = vm.isBlocked(c.mac),
                             onNameClick = { detailFor = c },
                             onIconClick = { pickerFor = c },
-                            onKickClick = { kickTarget = c }
+                            onKickClick = { blockTarget = c }
                         )
                     }
                 }
 
-                // 踢出结果提示：4 秒后自动消失
-                val msg = kickMsg
+                // 拉黑结果提示：4 秒后自动消失
+                val msg = blockMsg
                 if (msg != null) {
                     LaunchedEffect(msg) {
                         delay(4_000)
-                        kickMsg = null
+                        blockMsg = null
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -423,79 +518,6 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
                         color = AppTheme.textSecondary
                     )
                 }
-            }
-
-            val target = pickerFor
-            if (target != null) {
-                IconPickerDialog(
-                    current = vm.clientIconOf(target),
-                    title = target.displayName,
-                    onPick = { vm.setClientIcon(target.mac, it) },
-                    onReset = {
-                        vm.setClientIcon(target.mac, null)
-                        pickerFor = null
-                    },
-                    onDismiss = { pickerFor = null }
-                )
-            }
-
-            // 踢出确认：会真的断掉对方的无线连接，先让用户确认。
-            // 实现是 root shell 的 deauth（设备没有官方"断开客户端"接口），见 model/ClientDevice.kt
-            val kick = kickTarget
-            if (kick != null) {
-                AlertDialog(
-                    onDismissRequest = { if (!kicking) kickTarget = null },
-                    title = { Text("踢出设备") },
-                    text = {
-                        Text(
-                            "将断开「${vm.clientNameOf(kick)}」（${kick.mac}）的无线连接。\n\n" +
-                                "注意：对方如果仍保存着 WiFi 密码，通常会立刻自动重连。"
-                        )
-                    },
-                    confirmButton = {
-                        TextButton(
-                            enabled = !kicking,
-                            onClick = {
-                                scope.launch {
-                                    kicking = true
-                                    val err = vm.kickClient(kick)
-                                    kicking = false
-                                    kickTarget = null
-                                    if (err != null) {
-                                        kickMsg = err
-                                        return@launch
-                                    }
-                                    // 等设备端处理完再刷新，用"列表里还有没有它"给出真实结论。
-                                    // deauth 之后终端通常会自己重连，那样列表里还会出现它
-                                    delay(1_200)
-                                    vm.refreshAll(forceClients = true)
-                                    val still = vm.clients.any {
-                                        it.mac.equals(kick.mac, ignoreCase = true)
-                                    }
-                                    kickMsg = if (still) {
-                                        "「${vm.clientNameOf(kick)}」已断开，但可能又自动重连了"
-                                    } else {
-                                        "已踢出「${vm.clientNameOf(kick)}」"
-                                    }
-                                }
-                            }
-                        ) { Text(if (kicking) "处理中…" else "踢出") }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { kickTarget = null }) { Text("取消") }
-                    }
-                )
-            }
-
-            // 终端详情：点列表里的设备名称弹出
-            val detail = detailFor
-            if (detail != null) {
-                ClientDetailDialog(
-                    client = detail,
-                    alias = vm.clientAliasOf(detail.mac),
-                    onSaveName = { vm.setClientName(detail.mac, it) },
-                    onDismiss = { detailFor = null }
-                )
             }
         }
 
@@ -519,6 +541,80 @@ fun DashboardScreen(vm: MainViewModel, nav: NavHostController) {
 
         Spacer(Modifier.height(24.dp))
     }
+
+    // ── 全部弹窗（刻意放在 Column 之外，理由见本函数开头 Box 处的注释） ──
+
+    if (showDeviceInfo) {
+        DeviceInfoDialog(vm = vm, onDismiss = { showDeviceInfo = false })
+    }
+
+    val target = pickerFor
+    if (target != null) {
+        IconPickerDialog(
+            current = vm.clientIconOf(target),
+            title = target.displayName,
+            onPick = { vm.setClientIcon(target.mac, it) },
+            onReset = {
+                vm.setClientIcon(target.mac, null)
+                pickerFor = null
+            },
+            onDismiss = { pickerFor = null }
+        )
+    }
+
+    // 拉黑确认：把该设备 MAC 写进设备黑名单，它会连不上 WiFi。
+    // 契约见 model/ClientDevice.kt:AclState
+    val block = blockTarget
+    if (block != null) {
+        AlertDialog(
+            onDismissRequest = { if (!blocking) blockTarget = null },
+            title = { Text("拉黑设备") },
+            text = {
+                Text(
+                    "将把「${vm.clientNameOf(block)}」（${block.mac}）加入设备黑名单，\n" +
+                        "之后这台设备将无法连上本 WiFi。\n\n" +
+                        "可随时在「设置 → 黑名单」里解除。"
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !blocking,
+                    onClick = {
+                        scope.launch {
+                            blocking = true
+                            val err = vm.blockClient(block)
+                            blocking = false
+                            blockTarget = null
+                            if (err != null) {
+                                blockMsg = err
+                                return@launch
+                            }
+                            // 写成功后立刻回读，以设备返回的列表为准
+                            delay(800)
+                            vm.refreshAll(forceClients = true)
+                            blockMsg = "已拉黑「${vm.clientNameOf(block)}」"
+                        }
+                    }
+                ) { Text(if (blocking) "处理中…" else "拉黑") }
+            },
+            dismissButton = {
+                TextButton(onClick = { blockTarget = null }) { Text("取消") }
+            }
+        )
+    }
+
+    // 终端详情：点列表里的设备名称弹出
+    val detail = detailFor
+    if (detail != null) {
+        ClientDetailDialog(
+            client = detail,
+            alias = vm.clientAliasOf(detail.mac),
+            onSaveName = { vm.setClientName(detail.mac, it) },
+            onDismiss = { detailFor = null }
+        )
+    }
+
+    } // Box
 }
 
 /**
@@ -656,6 +752,62 @@ private fun numOf(base: JsonObject?, live: Map<String, String>, key: String): Do
     base?.get(key)?.takeIf { !it.isJsonNull }?.let { runCatching { it.asDouble }.getOrNull() }
         ?: live[key]?.trim()?.toDoubleOrNull()
 
+/**
+ * QCI（QoS Class Identifier）对应的数值颜色。
+ *
+ * QCI 是网络侧给这条承载打的优先级标签，数值越小优先级越高：
+ *   - 1~5：信令、VoLTE 语音、IMS 等实时业务（延迟敏感），按"好"着色；
+ *   - 6~9：普通数据承载，最常见的是 8（即 5G/LTE 默认上网承载），保持主文本色；
+ *   - 其余（10+ 或非法值）：归为最低优先级，用次要色弱化。
+ *
+ * 取不到值（null / 空 / "0"）时同样走次要色——"0" 在设备上是无效值而不是真的 0 级。
+ *
+ * ⚠️ 必须标 `@Composable`：`AppTheme.textPrimary` / `textSecondary` 不是普通常量，
+ *   而是 `AppTheme.kt` 里 `val ... get() = Color(...)` 形式的属性——它们读取
+ *   `LocalTheme`（CompositionLocal），**只能在 @Composable 上下文里访问**。
+ *   写成普通函数编译期就会报 "Functions which invoke @Composable functions
+ *   must be marked with the @Composable annotation"。
+ *   调用点在 `MetricCell(valueColor = ...)` 里，本就在 Composable 上下文中，无需改调用处。
+ */
+@Composable
+private fun qciColor(vm: MainViewModel): Color {
+    val v = qciValue(vm)
+    return when {
+        v == null -> AppTheme.textSecondary
+        v in 1..5 -> StatusGood
+        v in 6..9 -> AppTheme.textPrimary
+        else -> AppTheme.textSecondary
+    }
+}
+
+/**
+ * 取 QCI 数值。
+ *
+ * 设备在无业务承载时会回 "0"，那是无效值不是真的 0 级；取值范围按 1~255 收口
+ * （3GPP 里 QCI 就是这个范围）。
+ */
+private fun qciValue(vm: MainViewModel): Int? =
+    vm.live["qci"]?.trim()?.toIntOrNull()?.takeIf { it in 1..255 }
+
+/** QCI 显示文本，取不到回 "-" */
+private fun qciText(vm: MainViewModel): String = qciValue(vm)?.toString() ?: "-"
+
+/**
+ * 合约速率（AMBR）显示文本。
+ *
+ * goform 的 `ambr_dl_max` / `ambr_ul_max` 直接给 Mbps 数字字符串（如 `"500"`），
+ * 所以这里不需要解析数值再格式化，原样展示即可。
+ * 取不到时回 "-"，**不显示 0**——0 会被读成"速率是 0"，而实际是"没读到"。
+ *
+ * @param raw   goform 返回的原始字符串，null / 空 表示没读到
+ * @param arrow 方向前缀（`"↓"` / `"↑"`）；空串表示不带前缀
+ */
+private fun ambrText(raw: String?, arrow: String = ""): String {
+    val s = raw?.trim()?.takeIf { it.isNotEmpty() && it != "0" } ?: return "-"
+    return if (arrow.isEmpty()) "$s M" else "$arrow $s M"
+}
+
+
 /** 刷新状态提示：让"是否真的在实时刷新"在界面上可见（失败时红字） */
 @Composable
 private fun RefreshHint(vm: MainViewModel) {
@@ -686,6 +838,8 @@ private fun ClientRow(
     client: ClientDevice,
     icon: ClientIcon,
     name: String,
+    /** 该设备是否已在设备端黑名单里 */
+    blocked: Boolean = false,
     onNameClick: () -> Unit,
     onIconClick: () -> Unit,
     onKickClick: () -> Unit
@@ -732,6 +886,24 @@ private fun ClientRow(
                     Spacer(Modifier.width(6.dp))
                     BandBadge(client.bandLabel)
                 }
+                // 已在黑名单：加一枚红色标记，避免用户搞不清哪台被拉黑了。
+                // （拉黑后设备多半会掉线又重连回来，列表里还会看到它。）
+                if (blocked) {
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(Color(0xFFFF4D4F).copy(alpha = 0.18f))
+                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                    ) {
+                        Text(
+                            "已拉黑",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFFFF4D4F),
+                            maxLines = 1
+                        )
+                    }
+                }
             }
             Spacer(Modifier.height(2.dp))
             Text(
@@ -767,17 +939,20 @@ private fun ClientRow(
             )
         }
 
-        // 踢出按钮：向该终端发 deauth 断开连接。
-        // 设备没有官方"断开指定客户端"的接口，只能走 root shell：
-        // `iw dev <iface> station del <MAC>`，见 model/ClientDevice.kt:kickClientCmd
+        // 拉黑按钮：把该设备 MAC 写进设备端黑名单，它会连不上 WiFi。
+        // 契约见 model/ClientDevice.kt:AclState
         IconButton(
             onClick = onKickClick,
             modifier = Modifier.size(34.dp)
         ) {
             Icon(
-                Icons.Filled.WifiOff,
-                contentDescription = "踢出 ${client.displayName}",
-                tint = AppTheme.textMuted,
+                if (blocked) Icons.Filled.Block else Icons.Filled.WifiOff,
+                contentDescription = if (blocked) {
+                    "${client.displayName} 已在黑名单"
+                } else {
+                    "拉黑 ${client.displayName}"
+                },
+                tint = if (blocked) Color(0xFFFF4D4F) else AppTheme.textMuted,
                 modifier = Modifier.size(18.dp)
             )
         }

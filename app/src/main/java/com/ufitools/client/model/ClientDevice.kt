@@ -146,26 +146,112 @@ private val MAC_RE = Regex("^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 private val IFACE_NAME_RE = Regex("^[A-Za-z0-9_.-]{1,15}$")
 
 /**
- * 生成「踢出该终端」的 shell 命令；MAC 非法时返回 null（调用方忽略即可）。
+ * 校验用户手输的 MAC 是否合法（黑名单编辑页用）。
  *
- * 设备本身**没有**"断开指定客户端"的 goform/api —— 原厂 Web 控制台在设备管理里
- * 只提供黑名单（`setDeviceAccessControlList`）。但设备 root 权限下可以执行
- * `iw dev <iface> station del <MAC> subtype 0xC`，向该终端发送 deauthentication 帧，
- * 直接把它的无线连接踢掉（`iw ... station del` 已实测存在于该固件）。
- *
- * @param iface 该终端所在的无线接口（来自 `iw station dump`）。给了就先踢它，
- *              再兜底遍历全部接口——终端可能在 2.4G/5G 之间切过频段，只按旧接口踢会踢空。
- *
- * ⚠️ 被踢的终端通常会**自动重连**（AP 并未把它拉黑），这是预期行为。
- * 若需要"永久踢走"，得走 goform 黑名单。
+ * 宽容处理常见的几种写法：大小写混写、连字符分隔（`AA-BB-CC-DD-EE-FF`）。
+ * 合法则返回**规范化的冒号小写形式**，否则返回 null。
  */
-fun kickClientCmd(mac: String, iface: String? = null): String? {
-    val safe = mac.trim().lowercase()
-    if (!MAC_RE.matches(safe)) return null
-    val known = iface?.trim()?.takeIf { IFACE_NAME_RE.matches(it) }
-    val all = "\$(iw dev | awk '/Interface/{print \$2}')"
-    val devs = if (known == null) all else "$known $all"
-    return "for i in $devs; do iw dev \$i station del $safe subtype 0xC 2>/dev/null; done"
+fun normalizeMac(input: String): String? {
+    val raw = input.trim().lowercase().replace('-', ':').replace(" ", "")
+    if (!MAC_RE.matches(raw)) return null
+    return raw
+}
+
+/** 该接口名是否可用于拼 shell 命令 */
+fun isValidIface(name: String): Boolean = IFACE_NAME_RE.matches(name.trim())
+
+/**
+ * 设备接入控制（黑名单）状态。
+ *
+ * 契约全部来自**实测**（U60Pro / BD_CNMU5250V1.0.0B31），不是推测：
+ *
+ * ## 读取
+ * `GET goform_get_cmd_process?cmd=station_list,lan_station_list,queryDeviceAccessControlList,hostNameList&isTest=false&_=<ts>`
+ * + 登录 Cookie，**不能带 `multi_data=1`**。
+ * `queryDeviceAccessControlList` 是触发器，不带上它这三个字段就不返回（详见 GoformClient）。
+ *
+ * ## 写入
+ * `POST goformId=setDeviceAccessControlList`，字段：
+ * `AclMode` / `WhiteMacList`(空) / `BlackMacList` / `WhiteNameList`(空) / `BlackNameList`。
+ *
+ * ## ⚠️ 三条必须知道的实测行为
+ * 1. **`AclMode` 是设备自算的状态，不是你要设的模式**：
+ *    黑名单为空时它读出来是 `"0"`，**一旦拉黑了任何设备就自动变成 `"1"`**，
+ *    清空后自动回到 `"0"`。所以原厂 Web 端只是"读到什么就原样写回"。
+ *    这里沿用同样做法（[aclMode] 仅在读到时透传，未读到时传 `"0"`）。
+ * 2. **设备会对 `BlackMacList` 重新排序**（实测传 `aa:..;11:..`，回读变 `11:..;aa:..`）。
+ *    因此**必须以回读结果为唯一事实来源**，不能假设写进去的顺序。
+ * 3. **`BlackNameList` 与 `BlackMacList` 不是可靠的同序对应**：
+ *    实测写入 `aa:..;11:..` + 名称 `测试机;第二台`，回读得到
+ *    `BlackMacList="11:..;aa:.."` 而 `BlackNameList=";"` —— 中文名直接丢失。
+ *    **结论：`BlackNameList` 不可信，界面上一律用 MAC 作为主键与标题。**
+ */
+data class AclState(
+    /** 接入控制模式。设备自算：空黑名单=`0`，有黑名单=`1`。**不要自行编造语义。** */
+    val aclMode: String = "0",
+    /** 黑名单 MAC 列表（设备回读顺序，可能是设备重排过的） */
+    val blackMacs: List<String> = emptyList(),
+    /** 黑名单名称列表。⚠️ 设备端可能丢内容且与 MAC 不同序，**仅作参考，不可作主键**。 */
+    val blackNames: List<String> = emptyList()
+) {
+    val isEmpty: Boolean get() = blackMacs.isEmpty()
+
+    /**
+     * 黑名单条目：MAC 与名称配对。
+     *
+     * ⚠️ 名称只在下标能对上时才有意义（设备不同序/丢名），
+     * 界面应优先显示 MAC，名称仅作辅助。
+     */
+    val entries: List<Pair<String, String>>
+        get() = blackMacs.mapIndexed { i, mac -> mac to (blackNames.getOrNull(i) ?: "") }
+
+    fun containsMac(mac: String): Boolean =
+        blackMacs.any { it.equals(mac.trim(), ignoreCase = true) }
+
+    companion object {
+        /** 设备端的列表分隔符 */
+        const val SEP = ";"
+
+        /** 把设备返回的分号串解析为列表（去空、去首尾空格） */
+        fun parseList(raw: String?): List<String> =
+            raw?.split(SEP)?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+
+        /**
+         * 追加一条黑名单并去重（MAC 大小写不敏感）。
+         *
+         * 与设备端 `[mac_addr, ...blackMacList]` 的语义一致。
+         * 名称列表按 MAC 的下标同步维护，但**不要指望设备会保留它**（见类注释第 3 条）。
+         */
+        fun withEntry(state: AclState, mac: String, name: String): AclState {
+            val m = mac.trim()
+            if (m.isEmpty()) return state
+            val entries = state.entries.toMutableList()
+            val existing = entries.indexOfFirst { it.first.equals(m, ignoreCase = true) }
+            if (existing >= 0) {
+                if (name.isNotBlank()) entries[existing] = entries[existing].first to name.trim()
+            } else {
+                entries.add(m to name.trim())
+            }
+            return state.copy(
+                blackMacs = entries.map { it.first },
+                blackNames = entries.map { it.second }
+            )
+        }
+
+        /** 移除一条黑名单（MAC 大小写不敏感），名称列表同步删除对应下标 */
+        fun withoutMac(state: AclState, mac: String): AclState {
+            val idx = state.blackMacs.indexOfFirst { it.equals(mac.trim(), ignoreCase = true) }
+            if (idx < 0) return state
+            val macs = state.blackMacs.toMutableList().also { it.removeAt(idx) }
+            val names = state.blackNames.toMutableList().also {
+                if (idx < it.size) it.removeAt(idx)
+            }
+            return state.copy(blackMacs = macs, blackNames = names)
+        }
+
+        /** 序列化为设备端要的分号串 */
+        fun join(list: List<String>): String = list.joinToString(SEP)
+    }
 }
 
 /** 秒 → 可读时长。短时长优先显示秒/分钟，避免出现 "0分钟"。 */

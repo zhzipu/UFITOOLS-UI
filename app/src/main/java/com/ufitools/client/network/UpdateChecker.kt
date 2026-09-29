@@ -1,6 +1,7 @@
 package com.ufitools.client.network
 
 import android.os.Build
+import android.util.Log
 import com.google.gson.JsonParser
 import com.ufitools.client.model.UpdateInfo
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +21,19 @@ import java.util.concurrent.TimeUnit
  */
 object UpdateChecker {
 
+    private const val TAG = "UpdateChecker"
+
+    /**
+     * 最近一次检查失败的**具体原因**（异常类型 + 消息，或 `HTTP <code>`）。
+     *
+     * 存在的意义：以前所有失败都一律返回 null，界面只能笼统说一句"检查失败"，
+     * 分不清是 DNS 没就绪、超时、还是被 GitHub 限流（403）。
+     * 现在把它带回界面/日志，排查才有的放矢。
+     */
+    @Volatile
+    var lastError: String? = null
+        private set
+
     private const val LATEST_API =
         "https://api.github.com/repos/zhzipu/UFITOOLS-UI/releases/latest"
 
@@ -37,6 +51,7 @@ object UpdateChecker {
      * @return 成功返回 [UpdateInfo]；网络异常 / 解析失败 / 尚无 Release 时返回 null
      */
     suspend fun check(currentVersion: String): UpdateInfo? = withContext(Dispatchers.IO) {
+        lastError = null
         try {
             val req = Request.Builder()
                 .url(LATEST_API)
@@ -44,10 +59,23 @@ object UpdateChecker {
                 .header("User-Agent", "UFITOOLS-UI")
                 .build()
 
-            val body = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@withContext null
-                resp.body?.string()
-            } ?: return@withContext null
+            val response = client.newCall(req).execute()
+            val body = response.use { resp ->
+                if (!resp.isSuccessful) {
+                    // ⚠️ 非 2xx 也走"检查失败"，**必须把状态码记下来** ——
+                    // 否则 403（GitHub 限流）/502/DNS 失败在界面上长得一模一样，
+                    // 完全无从判断是"网络还没好"还是"被限流了"。
+                    lastError = "HTTP ${resp.code}"
+                    Log.w(TAG, "检查更新失败：HTTP ${resp.code}")
+                    ""
+                } else {
+                    resp.body?.string().orEmpty()
+                }
+            }
+            if (body.isBlank()) {
+                if (lastError == null) lastError = "响应体为空"
+                return@withContext null
+            }
 
             val o = JsonParser.parseString(body).asJsonObject
 
@@ -83,7 +111,11 @@ object UpdateChecker {
                 publishedAt = published,
                 hasUpdate = UpdateInfo.isNewer(version, currentVersion)
             )
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // 冷启动阶段失败多半是网络/DNS 未就绪，但**不能想当然**：
+            // 记录异常类型与消息，才能判断到底是 DNS、超时还是 TLS 问题。
+            lastError = "${e.javaClass.simpleName}: ${e.message ?: "无消息"}"
+            Log.w(TAG, "检查更新失败：$lastError", e)
             null
         }
     }

@@ -153,6 +153,7 @@
         </LinearLayout>
 
         <ImageView
+            android:id="@+id/widget_divider_line"
             android:layout_width="1dp"
             android:layout_height="30dp"
             android:background="@color/widget_divider"

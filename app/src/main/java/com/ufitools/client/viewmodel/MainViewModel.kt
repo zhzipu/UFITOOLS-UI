@@ -1,6 +1,8 @@
 package com.ufitools.client.viewmodel
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -13,14 +15,33 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
 import com.ufitools.client.data.ClientIconStore
+import com.ufitools.client.data.ClashConfig
+import com.ufitools.client.data.ClashConfigStore
 import com.ufitools.client.data.ConfigStore
 import com.ufitools.client.data.DeviceConfig
 import com.ufitools.client.data.RefreshInterval
 import com.ufitools.client.data.ThemeStore
+import com.ufitools.client.data.WebAutoLogin
+import com.ufitools.client.data.WebTheme
+import com.ufitools.client.data.WebThemeMapper
+import com.ufitools.client.model.AclState
 import com.ufitools.client.model.ApnProfile
 import com.ufitools.client.model.ClientDevice
 import com.ufitools.client.model.ClientIcon
+import com.ufitools.client.model.ClashConfigProbe
+import com.ufitools.client.model.ClashConnection
+import com.ufitools.client.model.ClashLogLevel
+import com.ufitools.client.model.ClashProvider
+import com.ufitools.client.model.ClashProxy
+import com.ufitools.client.model.ClashRule
+import com.ufitools.client.model.ClashRuleSet
+import com.ufitools.client.model.ClashRuntimeConfig
+import com.ufitools.client.model.ClashVersion
+import com.ufitools.client.model.applyRates
 import com.ufitools.client.model.IW_STATION_DUMP_CMD
+import com.ufitools.client.model.InstalledPlugin
+import com.ufitools.client.model.IpValidator
+import com.ufitools.client.model.LanSetting
 import com.ufitools.client.model.POWER_UBUS_CMD
 import com.ufitools.client.model.PowerMode
 import com.ufitools.client.model.PowerStatus
@@ -30,16 +51,32 @@ import com.ufitools.client.model.StorePlugin
 import com.ufitools.client.model.UploadedFile
 import com.ufitools.client.model.UpdateInfo
 import com.ufitools.client.model.UsagePoint
+import com.ufitools.client.model.WifiAp
+import com.ufitools.client.model.ClashProbe
 import com.ufitools.client.model.detectClientIcon
-import com.ufitools.client.model.kickClientCmd
+import com.ufitools.client.model.parseClashConfig
+import com.ufitools.client.model.parseClashConfigProbe
+import com.ufitools.client.model.parseClashConnections
+import com.ufitools.client.model.parseClashProviders
+import com.ufitools.client.model.parseClashProviderNodes
+import com.ufitools.client.model.mergeClashProxies
+import com.ufitools.client.model.parseClashProxies
+import com.ufitools.client.model.parseClashRules
+import com.ufitools.client.model.parseClashVersion
 import com.ufitools.client.model.parseIwStationDump
 import com.ufitools.client.model.parsePowerStatusUbus
 import com.ufitools.client.model.parseUsagePoints
 import com.ufitools.client.network.ApiClient
 import com.ufitools.client.network.ApiException
+import com.ufitools.client.network.ClashClient
+import com.ufitools.client.network.ClashException
+import com.ufitools.client.network.ClashLogStream
+import com.ufitools.client.network.Crypto
 import com.ufitools.client.network.GoformClient
+import com.ufitools.client.network.NfcState
 import com.ufitools.client.network.UbusClient
 import com.ufitools.client.network.UpdateChecker
+import com.ufitools.client.ui.theme.ThemePalettes
 import com.ufitools.client.ui.theme.ThemeMode
 import com.ufitools.client.widget.WidgetBus
 import com.ufitools.client.widget.WidgetSnapshot
@@ -130,6 +167,102 @@ data class SmsForwardConfig(
     }
 }
 
+/**
+ * 猫猫服务不可用时的统一提示。
+ *
+ * 地址写死、secret 自动读取之后，「连不上」的成因已经收敛成一种：
+ * 设备上没有在跑的 mihomo 内核（或没开 external-controller）。
+ * 内核原始的 Connection refused / timeout 对用户没有指导意义，统一换成这句。
+ */
+const val CLASH_NOT_RUNNING_HINT = "未安装/运行猫猫服务"
+
+/** 黑名单读取失败（设备没返回 AclMode，通常是会话过期后重登仍失败） */
+const val ACL_READ_FAILED_MSG = "读取黑名单失败：请检查「设置 → 修改口令」中的后台密码是否正确"
+
+/** 黑名单写入前的登录失败提示（与 [LOGIN_FAILED_MSG] 同因，文案指向同一处设置） */
+const val ACL_LOGIN_FAILED_MSG =
+    "登录设备后台失败：请确认「设置 → 修改口令」里填的是设备 Web 控制台的管理密码"
+
+/**
+ * 剥掉文件扩展名（`u60屏幕管理插件.txt` → `u60屏幕管理插件`）。
+ *
+ * 用于插件名归一化：设备 custom_head 里的块名没有扩展名，
+ * 而商店侧的 `installName` / `publicName` 往往带 `.txt` / `.js`，
+ * 不剥就永远匹配不上（商店的「已安装」标记不会亮、已安装列表也认不出对应条目）。
+ *
+ * 保护条件：`i <= 0`（无扩展名或隐藏文件）与 `i < s.length - 8`（后缀过长、像域名而非扩展名）都不剥。
+ */
+private fun stripExt(s: String): String {
+    val i = s.lastIndexOf('.')
+    if (i <= 0 || i < s.length - 8) return s
+    return s.substring(0, i).ifEmpty { s }
+}
+
+/**
+ * 插件块匹配正则。
+ *
+ * 与官方前端 `main.js` 中的 `parsePluginBlocks` 严格等价：
+ * 起止标记里的块名必须一致（`\1` 反向引用），否则视为残缺块不予处理。
+ * 块内容（第二个捕获组）可能包含任意 HTML/JS，因此必须用非贪婪 + DOTALL 语义。
+ */
+private val PLUGIN_BLOCK_RE = Regex(
+    "<!--\\s*\\[KANO_PLUGIN_START\\]\\s*(.*?)\\s*-->([\\s\\S]*?)<!--\\s*\\[KANO_PLUGIN_END\\]\\s*\\1\\s*-->",
+)
+
+/**
+ * 按块名删除插件块（含块后紧随的空白）。
+ *
+ * 对应官方 `stripPluginBlocksByNames`。删除的是**整块**：起止标记 + 块内容，
+ * 并顺带吃掉块后连续的换行/空格，避免反复卸载后 custom_head 里堆积空行。
+ * 名字集合为空时原样返回（防御空参数导致的"清空全部"事故）。
+ */
+private fun stripPluginBlocks(text: String, names: Set<String>): String {
+    val nameSet = names.mapNotNull { it.trim().takeIf(String::isNotEmpty) }.toSet()
+    if (nameSet.isEmpty()) return text
+    val re = Regex(
+        "<!--\\s*\\[KANO_PLUGIN_START\\]\\s*(.*?)\\s*-->[\\s\\S]*?<!--\\s*\\[KANO_PLUGIN_END\\]\\s*\\1\\s*-->[ \\t]*\\n?",
+    )
+    return re.replace(text) { m ->
+        val name = m.groupValues[1].trim()
+        if (nameSet.contains(name)) "" else m.value
+    }
+}
+
+/**
+ * 在 custom_head 文本里交换两个插件块的位置，用于「上移 / 下移」。
+ *
+ * custom_head 里的插件块是**顺序执行**的，所以排序不是展示层的排序，
+ * 而是真实写回设备、改变执行次序。做法：把每个块换成占位符，
+ * 得到骨架 + 块内容列表，交换列表元素后回填，块外内容（非插件 HTML）位置不动。
+ *
+ * @param from 原下标，@param to 目标下标（越界直接原样返回）
+ */
+private fun reorderPluginBlocks(text: String, from: Int, to: Int): String {
+    val matches = PLUGIN_BLOCK_RE.findAll(text).toList()
+    if (from !in matches.indices || to !in matches.indices || from == to) return text
+
+    val blocks = matches.map { it.value }.toMutableList()
+    val moved = blocks.removeAt(from)
+    blocks.add(to, moved)
+
+    // 用唯一的哨兵占位，避免块内容里恰好含有 \\u0000 之类字符造成误替换
+    val sb = StringBuilder()
+    var cursor = 0
+    matches.forEachIndexed { i, m ->
+        sb.append(text, cursor, m.range.first)
+        sb.append("\u0000KANO_PLUGIN_SLOT_").append(i).append("\u0000")
+        cursor = m.range.last + 1
+    }
+    sb.append(text, cursor, text.length)
+
+    var out = sb.toString()
+    blocks.forEachIndexed { i, block ->
+        // 槽位 i 现在放 blocks[i]；blocks 已是重排后的结果
+        out = out.replace("\u0000KANO_PLUGIN_SLOT_$i\u0000", block)
+    }
+    return out
+}
+
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val configStore = ConfigStore(app)
@@ -152,6 +285,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private val ubus = UbusClient(api)
 
+    /**
+     * Clash 面板（mihomo external-controller）配置与客户端。
+     *
+     * 与设备那套连接配置**无关**：面板跑在独立的 9090 端口上，
+     * 有自己的地址与 secret，因此单独存一份（见 [ClashConfigStore]）。
+     */
+    private val clashStore = ClashConfigStore(app)
+    private val clash = ClashClient { clashConfig }
+
+    /**
+     * 内核日志流（`WS /logs`）。
+     *
+     * ⚠️ 这是**长连接**，必须由界面在进入/离开日志页时显式 start/stop，
+     * 不能跟着主轮询走。ViewModel 销毁时由 [onCleared] 兜底释放。
+     */
+    private val clashLog = ClashLogStream(clash)
+
     // ------------------------------------------------------------------ 主题
 
     /** 当前配色 ID：0 默认 / 1 科技蓝 / 2 薄荷绿 / 3 梦幻紫 / 4 活力橙 */
@@ -164,12 +314,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setPalette(id: Int) {
         paletteId = id
         themeStore.savePaletteId(id)
+        refreshWidgetTheme()
     }
 
     /** 应用主题明暗模式并持久化（方法名避开 themeMode 生成的 setter，防止 JVM 签名冲突） */
     fun applyThemeMode(mode: ThemeMode) {
         themeMode = mode
         themeStore.saveThemeMode(mode.key)
+        refreshWidgetTheme()
+    }
+
+    /**
+     * 主题（配色 / 明暗）变了，通知桌面小组件按新配色重绘。
+     *
+     * 小组件不在 Compose 树里，读的是 `ThemeStore` + `RemoteViews`，
+     * **不会**跟着 `LocalPalette` 自动重组；不显式广播的话，用户改完主题
+     * 得等到下一次数据指纹变化（最多 10 秒、甚至更久）才看到桌面变色，
+     * 而且明暗模式单独改时指纹根本不变 —— 可能一直不变色。
+     *
+     * 直接发广播、不走 [pushWidgetSnapshot]：后者有指纹去重与最小间隔两道闸，
+     * 而这里颜色变了但数据没变，会被指纹闸直接拦掉。
+     */
+    private fun refreshWidgetTheme() {
+        val app = getApplication<Application>()
+        // 配色存在 ThemeStore 里，widget 侧渲染时会重新读取，这里只需触发重建
+        WidgetBus.notifyAll(app)
     }
 
     // ------------------------------------------------------------------ 状态
@@ -269,6 +438,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var installedPlugins by mutableStateOf<Set<String>>(emptySet())
         private set
 
+    /**
+     * 设备上**已安装**的插件（带版本与顺序），来自 `custom_head` 里的插件块。
+     *
+     * 与 [storePlugins] 是两回事：后者是远端商店的全量列表，与设备状态无关。
+     */
+    var installedPluginList by mutableStateOf<List<InstalledPlugin>>(emptyList())
+        private set
+
     /** 插件未读通知文本列表 */
     var pluginNotifications by mutableStateOf<List<String>>(emptyList())
         private set
@@ -326,6 +503,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 检查 GitHub 上的新版本。
      *
+     * ⚠️ **冷启动时必须先等网络就绪**：App 刚起来时 Android 的网络栈 / DNS
+     * 往往还没建立完，此时直接请求 `api.github.com` 必然解析失败或超时 ——
+     * 表现就是"刚进 App 检查更新总失败，过几分钟又正常"（[awaitNetworkReady]）。
+     *
      * @param silent 启动自动检查传 true：失败或已是最新都静默，只在发现新版时由界面弹窗；
      *               用户在「关于」里手动点则传 false，会返回一句可 Toast 的结果。
      * @return 一句面向用户的结果文案（silent 时也可能为空串）
@@ -334,11 +515,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (updateChecking) return ""
         updateChecking = true
         return try {
-            val info = UpdateChecker.check(appVersion)
+            if (!awaitNetworkReady()) {
+                return if (silent) "" else "当前无网络连接，请检查网络后重试"
+            }
+            // 网络刚就绪的一瞬间 DNS 可能还没生效，失败就补一次再下结论
+            var info = UpdateChecker.check(appVersion)
+            if (info == null) {
+                delay(UPDATE_RETRY_DELAY_MS)
+                info = UpdateChecker.check(appVersion)
+            }
             updateInfo = info
             when {
-                info == null ->
-                    if (silent) "" else "检查更新失败，请检查网络后重试"
+                // 失败时把 [UpdateChecker.lastError] 一并带出来（如 DNS 解析失败 / HTTP 403）——
+                // 只说"检查失败"没法判断该改网络还是等一会儿再试
+                info == null -> if (silent) "" else
+                    "检查更新失败：${UpdateChecker.lastError ?: "未知原因"}"
                 info.hasUpdate -> {
                     updateDialogDismissed = false
                     "发现新版本 ${info.version}"
@@ -353,6 +544,36 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * 等待系统报告「网络可用」，最多等 [NETWORK_WAIT_TIMEOUT_MS]。
+     *
+     * 存在的意义就是修掉「冷启动检查更新必失败」：进程刚起来那几秒，
+     * `ConnectivityManager` 还没给出带 `NET_CAPABILITY_INTERNET` 的网络，
+     * 这时发出去的请求会以 `UnknownHostException` / 超时告终。
+     * 先等它就绪，可以免掉那次注定失败的尝试。
+     *
+     * 判据只用 `NET_CAPABILITY_INTERNET` 而**不加 `NET_CAPABILITY_VALIDATED`**：
+     * 后者要等系统完成一次真实连通性探测，冷启动时会慢很多；
+     * 这里宁可"早放行 + 靠调用方重试兜底"，也不要让用户干等。
+     *
+     * @return true = 已有可用网络；false = 超时（大概率真的没网）
+     */
+    private suspend fun awaitNetworkReady(): Boolean {
+        val cm = getApplication<Application>()
+            .getSystemService(ConnectivityManager::class.java)
+            // 拿不到服务时不要阻塞功能，直接放行让请求自己去撞
+            ?: return true
+        val deadline = System.currentTimeMillis() + NETWORK_WAIT_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true) {
+                return true
+            }
+            delay(NETWORK_POLL_INTERVAL_MS)
+        }
+        return false
+    }
+
+    /**
      * 记录/清除页面级错误。
      *
      * ⚠️ **不能叫 `setPageError`**：`pageError` 是公开 `var`，Kotlin 会自动生成
@@ -361,6 +582,561 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun reportPageError(page: String, msg: String?) {
         pageError = if (msg == null) pageError - page else pageError + (page to msg)
+    }
+
+    // ================================================================== Clash 面板
+
+    /** 面板配置（地址 + secret），改动即持久化 */
+    var clashConfig by mutableStateOf(clashStore.load())
+        private set
+
+    /** 内核版本；null 表示尚未成功连上面板 */
+    var clashVersion by mutableStateOf<ClashVersion?>(null)
+        private set
+
+    /** 内核运行配置（模式 / TUN / 端口…） */
+    var clashRuntime by mutableStateOf<ClashRuntimeConfig?>(null)
+        private set
+
+    /** 全部代理与策略组，策略组排在前面 */
+    var clashProxies by mutableStateOf<List<ClashProxy>>(emptyList())
+        private set
+
+    /** 代理集（订阅），用于展示剩余流量与到期时间 */
+    var clashProviders by mutableStateOf<List<ClashProvider>>(emptyList())
+        private set
+
+    /** 活动连接（按流量降序） */
+    var clashConnections by mutableStateOf<List<ClashConnection>>(emptyList())
+        private set
+
+    /** 连接汇总：累计上下行 */
+    var clashDownTotal by mutableStateOf(0L)
+        private set
+    var clashUpTotal by mutableStateOf(0L)
+        private set
+
+    /** 内核内存占用（字节） */
+    var clashMemory by mutableStateOf(0L)
+        private set
+
+    /** 上一次连接快照的时间戳，用于算实时速率；0 表示还没有基准 */
+    private var clashTrafficAt = 0L
+
+    /** 正在测速的节点名（含策略组）；空集表示没有测速进行中 */
+    var clashTesting by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /**
+     * 面板整体状态：null=未探测 / true=已连通 / false=探测失败。
+     *
+     * 不用 `ConnectionStatus`：那是设备连接的语义，面板是独立通道，
+     * 设备连不上时面板仍可能正常（反之亦然）。
+     */
+    var clashOnline by mutableStateOf<Boolean?>(null)
+        private set
+
+    /** 面板最近一次错误文案；null 表示上一轮成功 */
+    var clashError by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * 「从设备读取」的结果；null 表示还没读过。
+     *
+     * 这个状态存在的唯一理由：面板地址与 secret 通常只有设备上的
+     * mihomo 配置文件知道，用户第一次填时基本是空的。与其让用户去
+     * 翻 yaml，不如点一下按钮直接替他读出来。
+     */
+    var clashProbe by mutableStateOf<ClashConfigProbe?>(null)
+        private set
+
+    /** 正在读取设备配置（按钮转圈用） */
+    var clashProbeLoading by mutableStateOf(false)
+        private set
+
+    /** 读取过程的提示文案，供弹窗内直接展示 */
+    var clashProbeMessage by mutableStateOf<String?>(null)
+        private set
+
+    /** 策略组列表（界面按组展示，节点跟在组下面） */
+    val clashGroups: List<ClashProxy> get() = clashProxies.filter { it.isGroup }
+
+    /** 未被任何策略组引用的自由节点，兜底展示用 */
+    val clashLooseProxies: List<ClashProxy>
+        get() = clashProxies.filter { !it.isGroup && it.isSelectable }
+
+    /**
+     * 从设备上读回 mihomo 的 `secret` 并存入本地。
+     *
+     * 走 `/api/run_shell`——这是设备上唯一能读到 mihomo 配置的通道。
+     * **不抛异常**：读不到不是错误，只是没有这个能力（未装内核、
+     * 固件不给 shell、配置路径不在候选列表里）。
+     *
+     * ⚠️ 必须是「不抛」的：本方法由界面按钮经 `scope.launch` 直接调用，
+     * 而 `rememberCoroutineScope()` 里未捕获的异常会直冒线程默认处理器导致闪退
+     * （本项目已因此崩过一次，见 MainViewModel 的 `safe { }` 约定）。
+     *
+     * @return 可直接展示给用户的提示文案
+     */
+    suspend fun probeClashFromDevice(): String {
+        clashProbeLoading = true
+        clashProbeMessage = null
+        try {
+            val out = try {
+                api.runShell(ClashProbe.clashConfigProbeCmd())
+            } catch (e: ApiException) {
+                if (e.code == 401) {
+                    // 设备令牌过期：重取一次再跑（与终端列表同一套兜底）
+                    api.refreshDeviceToken()
+                    api.runShell(ClashProbe.clashConfigProbeCmd())
+                } else {
+                    clashProbe = null
+                    val m = "读取设备配置失败：${e.message ?: "设备未连接"}"
+                    clashProbeMessage = m
+                    return m
+                }
+            }
+
+            val probe = parseClashConfigProbe(out)
+            clashProbe = probe
+
+            // 读到 secret 就地存下来：下次冷启动直接用它探活，
+            // 不必再跑一次 shell（shell 通道比 HTTP 慢得多，且要设备在线）。
+            if (probe.found && probe.secret.isNotBlank() && probe.secret != clashConfig.secret) {
+                clashStore.saveSecret(probe.secret)
+                clashConfig = clashConfig.copy(secret = probe.secret)
+            }
+
+            val msg = when {
+                !probe.found ->
+                    "设备上没找到 mihomo 配置文件。\n" +
+                        "可能内核还没装，或配置放在了非标准路径，请手动填写地址与密码。"
+
+                else -> buildString {
+                    append("已从 ")
+                    append(probe.configPath)
+                    append(" 读取：\n")
+                    append("• 密码：")
+                    append(probe.secret.ifBlank { "（未设置）" })
+                    append("\n• 监听：")
+                    append(probe.controller.ifBlank { "（未配置）" })
+                    if (probe.loopbackOnly) {
+                        append("\n\n⚠ 监听地址是回环地址，手机连不上。")
+                        append("需要把 external-controller 改成 0.0.0.0:")
+                        append(probe.port.ifBlank { "9090" })
+                        append(" 后重启内核。")
+                    }
+                    if (probe.hasPanel) {
+                        append("\n\n设备上已装面板：")
+                        append(probe.externalUiName.ifBlank { "（未记录名称）" })
+                    }
+                }
+            }
+            clashProbeMessage = msg
+            return msg
+        } catch (e: Exception) {
+            // 兜底：设备未连接、令牌取不到、shell 通道异常等都在这里收口
+            clashProbe = null
+            val m = "读取设备配置失败：${e.message ?: "未知错误"}"
+            clashProbeMessage = m
+            return m
+        } finally {
+            clashProbeLoading = false
+        }
+    }
+
+    /** 正在自动连接（读 secret + 探活）的标记 */
+    var clashAutoConnecting by mutableStateOf(false)
+        private set
+
+    /** 本次自动初始化是否已经跑过，避免每次进页面都重跑 */
+    private var clashAutoInitDone = false
+
+    /**
+     * 自动连接猫猫服务：读设备配置拿 secret → 探活。
+     *
+     * 这是本页唯一的连接入口（界面上已没有地址/密码输入框）。
+     * 流程：
+     * 1. 若本地没有 secret，先从设备配置里读一次；
+     * 2. 用「固定地址 + secret」探活；
+     * 3. 仍失败**再读一次**再探——覆盖「内核刚启动、secret 变了」的情形。
+     *
+     * 只跑一次（[clashAutoInitDone] 去重）；用户点「重试」时走 [retryClash]，
+     * 那条路径允许反复触发。
+     *
+     * ⚠️ 不抛异常：本方法由界面 `LaunchedEffect` 直接调用。
+     */
+    suspend fun autoConnectClash() {
+        if (clashAutoInitDone) return
+        clashAutoInitDone = true
+        clashAutoConnecting = true
+        try {
+            // 本地没存过 secret 才去读设备——省一次 shell 往返
+            if (clashConfig.secret.isBlank()) {
+                probeClashFromDevice()
+            }
+            refreshClash()
+            // 第一次探活失败 → 很可能是 secret 过期/内核刚换过，再读一次重试
+            if (clashOnline != true) {
+                probeClashFromDevice()
+                refreshClash()
+            }
+        } catch (_: Exception) {
+            // refreshClash 内部已收口；这里只兜底极端情况，保证不冒泡
+        } finally {
+            clashAutoConnecting = false
+        }
+    }
+
+    /** 手动重试：允许重复触发，会重新读一次 secret */
+    suspend fun retryClashAuto() {
+        clashAutoConnecting = true
+        try {
+            probeClashFromDevice()
+            retryClash()
+        } catch (_: Exception) {
+        } finally {
+            clashAutoConnecting = false
+        }
+    }
+
+    /**
+     * 一次拉全：版本 + 配置 + 代理 + 订阅。
+     *
+     * 面板轮询比设备轮询重（4 个请求），因此由界面按需触发，
+     * **不挂进主轮询**；只有「连接列表」才值得高频刷新，单独有 [refreshClashConnections]。
+     */
+    suspend fun refreshClash() {
+        page("clash", Unit) {
+            // 版本接口是最轻的探活手段：先把它与配置一起拿到
+            val v = parseClashVersion(clash.version())
+            val cfg = parseClashConfig(clash.configs())
+            clashVersion = v
+            clashRuntime = cfg
+            clashOnline = true
+            clashStore.setWasConnected(true)
+
+            // 代理与订阅属于「大响应」，失败不应把整页判死，各自兜底。
+            //
+            // ⚠️ **节点必须从两个来源合并**：`/proxies` 顶层只给内置项与策略组，
+            // **不给代理集提供的节点**（实机：顶层 8 个 vs provider 里 46 个）。
+            // 只读顶层会导致策略组里除 DIRECT 外的成员全找不到实体，
+            // 界面表现为「43 个成员只出 1 张卡」。
+            // `clash.providers()` 本来就要调（订阅页要用），**不额外增加请求**。
+            val providerNodes = try {
+                parseClashProviderNodes(clash.providers())
+            } catch (_: Exception) {
+                emptyList()
+            }
+            clashProxies = try {
+                mergeClashProxies(parseClashProxies(clash.proxies()), providerNodes)
+            } catch (_: Exception) {
+                clashProxies
+            }
+            clashProviders = try {
+                parseClashProviders(clash.providers())
+            } catch (_: Exception) {
+                clashProviders
+            }
+            // 连接与流量汇总也一起拉，避免首帧概览显示 0
+            try {
+                reportClashConnections(parseClashConnections(clash.connections()))
+            } catch (_: Exception) {
+                // 连接接口失败不影响「已连通」的判定
+            }
+        }
+        clashError = pageError["clash"]
+        clashOnline = pageError["clash"] == null
+        if (clashOnline == false) {
+            // 探活失败：把版本清掉，界面据此回落到「未连接」形态
+            clashVersion = null
+            // 地址是写死的、secret 是自动读的，所以连不上只剩下一种可能：
+            // **设备上压根没有在跑的猫猫服务**（内核没装 / 没启动 / 没开 external-controller）。
+            // 内核原始报错（Connection refused / timeout）对用户没有指导意义，统一换成一句人话。
+            clashError = CLASH_NOT_RUNNING_HINT
+        }
+    }
+
+    /**
+     * 只刷连接列表（轻量端点，适合在面板页停留时高频调用）。
+     *
+     * @param silent 为 true 时不写 [pageError]，避免后台自动刷新把错误弹到界面
+     */
+    suspend fun refreshClashConnections(silent: Boolean = false) {
+        if (silent) {
+            try {
+                reportClashConnections(parseClashConnections(clash.connections()))
+            } catch (_: Exception) {
+                // 静默刷新失败就维持现状，等下一次
+            }
+            return
+        }
+        page("clashConn", Unit) {
+            reportClashConnections(parseClashConnections(clash.connections()))
+        }
+    }
+
+    /**
+     * 写入连接快照，并顺带算出实时速率。
+     *
+     * ## 为什么速率要在 App 侧算
+     *
+     * 内核的 `/connections` **只给累计流量**，没有「当前速率」字段
+     * （zashboard 也是同样处理）。做法是：拿上一次快照，用每条连接的
+     * `download`/`upload` 增量除以两次快照的时间差。
+     *
+     * 三条防线：
+     * - **旧快照为空时不抹零**：首次进入页面没有基准，用 0 而不是把累计值当速率；
+     * - **负增量当 0**：内核重启会让计数器回绕，直接算会得到巨大负数；
+     * - **时间差过小不更新**：两次刷新挤在几十毫秒内，除出来的数字会乱跳。
+     */
+    private fun reportClashConnections(sum: com.ufitools.client.model.ClashConnectionSummary) {
+        val nowAt = System.currentTimeMillis()
+        val prevSnapshot = clashConnections
+        val prevAt = clashTrafficAt
+        clashConnections = applyRates(sum.connections, prevSnapshot, prevAt, nowAt)
+        clashTrafficAt = nowAt
+        clashDownTotal = sum.downloadTotal
+        clashUpTotal = sum.uploadTotal
+        clashMemory = sum.memory
+    }
+
+    /**
+     * 切换内核运行模式（rule / global / direct）。
+     *
+     * ⚠️ 不叫 `setClashMode`——[clashRuntime] 若是公开 `var` 会生成 setter 撞名，
+     * 命名约定见 [reportPageError]。
+     */
+    suspend fun applyClashMode(mode: String): String = safe {
+        clash.setMode(mode)
+        // 内核改完不回读；这里乐观更新，界面不必等下一轮刷新
+        clashRuntime = clashRuntime?.copy(mode = mode)
+        "success"
+    }
+
+    /** 切换 TUN 模式 */
+    suspend fun applyClashTun(enable: Boolean): String = safe {
+        clash.setTun(enable)
+        clashRuntime = clashRuntime?.copy(tunEnabled = enable)
+        "success"
+    }
+
+    /**
+     * 策略组切换到指定节点。
+     *
+     * 成功后顺手更新本地策略组的 `now`，让界面立刻反映选择，不用等整页刷新。
+     */
+    suspend fun selectClashNode(group: String, node: String): String = safe {
+        clash.selectProxy(group, node)
+        clashProxies = clashProxies.map { p ->
+            if (p.isGroup && p.name == group) p.copy(now = node) else p
+        }
+        "success"
+    }
+
+    /**
+     * 单节点测速。
+     *
+     * 测速是长耗时操作（可达 5 秒），用 [clashTesting] 标记「进行中」，
+     * 结果写回对应代理的 [ClashProxy.delay]。
+     */
+    suspend fun testClashNode(name: String): String = safe {
+        clashTesting = clashTesting + name
+        try {
+            val d = clash.delay(name)
+            clashProxies = clashProxies.map { p ->
+                if (p.name == name) p.copy(delay = d, alive = d > 0) else p
+            }
+            if (d > 0) "延迟 $d ms" else "测速失败（节点不可达）"
+        } finally {
+            clashTesting = clashTesting - name
+        }
+    }
+
+    /**
+     * 整个策略组测速。
+     *
+     * 内核的组测速接口会并发测完组内全部节点，耗时可能到 10 秒以上，
+     * 期间把组名放进 [clashTesting] 让按钮显示进度。
+     */
+    suspend fun testClashGroup(group: String): String = safe {
+        clashTesting = clashTesting + group
+        try {
+            val result = clash.groupDelay(group)
+            // 注意：safe 不是 inline，不能用 return@safe 做非局部返回，这里用表达式收口
+            if (result.isEmpty()) {
+                "测速未返回结果"
+            } else {
+                clashProxies = clashProxies.map { p ->
+                    val d = result[p.name]
+                    if (d != null) p.copy(delay = d, alive = d > 0) else p
+                }
+                val ok = result.values.count { it > 0 }
+                "完成：$ok/${result.size} 个节点可达"
+            }
+        } finally {
+            clashTesting = clashTesting - group
+        }
+    }
+
+    /**
+     * 批量测速指定节点（用于「一键测速」）。
+     *
+     * 串行执行，避免同时打出几十个请求把内核拖死；每测完一个就写回状态，
+     * 界面能看到延迟逐个出现。
+     */
+    suspend fun testClashNodes(names: List<String>, onProgress: (Int, Int) -> Unit = { _, _ -> }): String {
+        if (names.isEmpty()) return "没有可测速的节点"
+        var ok = 0
+        names.forEachIndexed { i, name ->
+            clashTesting = clashTesting + name
+            try {
+                val d = clash.delay(name)
+                clashProxies = clashProxies.map { p ->
+                    if (p.name == name) p.copy(delay = d, alive = d > 0) else p
+                }
+                if (d > 0) ok++
+            } catch (_: Exception) {
+                // 单点失败不中断整批，继续测下一个
+            } finally {
+                clashTesting = clashTesting - name
+            }
+            onProgress(i + 1, names.size)
+        }
+        return "完成：$ok/${names.size} 个节点可达"
+    }
+
+    /** 关闭全部连接 */
+    suspend fun closeAllClashConnections(): String = safe {
+        clash.closeAllConnections()
+        clashConnections = emptyList()
+        "success"
+    }
+
+    /** 关闭单条连接 */
+    suspend fun closeClashConnection(id: String): String = safe {
+        clash.closeConnection(id)
+        clashConnections = clashConnections.filterNot { it.id == id }
+        "success"
+    }
+
+    /** 更新订阅（代理集） */
+    suspend fun updateClashProvider(name: String): String = safe {
+        clash.updateProvider(name)
+        "success"
+    }
+
+    /** 刷新面板数据后清空错误提示（供界面「重试」按钮用） */
+    suspend fun retryClash() {
+        reportPageError("clash", null)
+        clashOnline = null
+        refreshClash()
+    }
+
+    // ------------------------------------------------------------------ 规则页
+
+    /** 全部分流规则 */
+    var clashRules by mutableStateOf<List<ClashRule>>(emptyList())
+        private set
+
+    /** 内核声明的规则总数（可能大于实际下发条数） */
+    var clashRuleTotal by mutableStateOf(0)
+        private set
+
+    /** 规则集订阅（`/providers/rules`） */
+    var clashRuleProviders by mutableStateOf<List<ClashProvider>>(emptyList())
+        private set
+
+    /** 规则页的加载中标记；单独一个，不跟主刷新打架 */
+    var clashRulesLoading by mutableStateOf(false)
+        private set
+
+    /** 拉取全部规则。规则动辄几千条，是「大响应」，失败不把整页判死 */
+    suspend fun refreshClashRules() {
+        clashRulesLoading = true
+        try {
+            try {
+                val set: ClashRuleSet = parseClashRules(clash.rules())
+                clashRules = set.rules
+                clashRuleTotal = set.total
+            } catch (_: Exception) {
+                // 保持原有列表，让用户看到上次结果而不是一片空白
+            }
+            try {
+                clashRuleProviders = parseClashProviders(clash.ruleProviders())
+            } catch (_: Exception) {
+                // 规则集订阅是可选端点，失败静默
+            }
+        } finally {
+            clashRulesLoading = false
+        }
+    }
+
+    /** 规则集订阅更新 */
+    suspend fun updateClashRuleProvider(name: String): String = safe {
+        clash.updateRuleProvider(name)
+        "已触发更新，稍后刷新查看"
+    }
+
+    // ------------------------------------------------------------------ 日志页
+
+    /**
+     * 日志流状态源，供界面 `collectAsState()` 使用。
+     *
+     * 日志走 StateFlow 而不是 `mutableStateOf`：日志是**高频率**推送
+     * （繁忙时每秒数百条），由流自身做环形缓冲与背压，比每来一条就写一次
+     * Compose 状态更适合。
+     */
+    val clashLogStream: ClashLogStream get() = clashLog
+
+    /** 当前订阅的日志等级 */
+    var clashLogLevel by mutableStateOf(ClashLogLevel.INFO)
+        private set
+
+    /** 日志是否「暂停自动滚动」。暂停时连接不断，只是界面不再吸底 */
+    var clashLogPaused by mutableStateOf(false)
+        private set
+
+    /** 是否正在接收日志（界面切到日志 Tab 时置 true） */
+    var clashLogActive by mutableStateOf(false)
+        private set
+
+    /**
+     * 进入日志页：建立连接。
+     *
+     * ⚠️ 必须在页面离开时调 [leaveClashLogs]，否则长连接会一直挂着。
+     */
+    fun enterClashLogs() {
+        clashLogActive = true
+        clashLog.start(clashLogLevel)
+    }
+
+    /** 离开日志页：断开连接，省电省流量 */
+    fun leaveClashLogs() {
+        clashLogActive = false
+        clashLog.stop()
+    }
+
+    /** 切换订阅等级（会触发重连，内核只在建连时读 level） */
+    fun applyClashLogLevel(level: ClashLogLevel) {
+        clashLogLevel = level
+        clashLog.setLevel(level)
+    }
+
+    /**
+     * 暂停/恢复自动滚动。**不**断连接，日志仍在后台累积。
+     *
+     * 命名带 `Paused` 以对齐界面调用；**不叫** `setClashLogPaused`，
+     * 避免与 `var clashLogPaused` 生成的 setter 撞名（见类头命名约定）。
+     */
+    fun toggleClashLogPaused() {
+        clashLogPaused = !clashLogPaused
+    }
+
+    /** 清空已收日志 */
+    fun clearClashLogs() {
+        clashLog.clear()
+        clashLogPaused = false
     }
 
     /** 终端自定义图标：MAC(小写) -> ClientIcon.key；无记录表示沿用自动识别 */
@@ -403,6 +1179,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 上一次刷新 WiFi 双频段开关的时间（走 goform 查询命令，单独限流） */
     private var lastWifiBandAt = 0L
+
 
     /** 上一次向桌面小组件推送数据的时间（推送很轻，但仍不希望每轮刷新都惊动桌面） */
     private var lastWidgetPushAt = 0L
@@ -511,26 +1288,388 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         wifiBands = wifiBandStates()
     }
 
-    // ------------------------------------------------------------------ 踢出终端
+    // ------------------------------------------------------------------ WiFi 设置（SSID / 密码 / 安全模式）
 
     /**
-     * 踢出一个已连接终端。
+     * 两个频段的 AP 配置。null = 还没读到；空 = 读不到 AP（WiFi 模块可能整体关闭）。
      *
-     * 设备没有"断开指定客户端"的官方接口，这里用 root shell 执行
-     * `iw dev <iface> station del <MAC> subtype 0xC` 发 deauth，见 [kickClientCmd]。
-     *
-     * @return null 表示指令已成功下发；否则返回失败原因（供界面提示）
+     * 只在「WiFi 设置」页进入/刷新时拉取 —— `queryAccessPointInfo` 返回整个 AP
+     * 配置（比单字段查询重），不进主轮询（频段开关状态另由 [wifiBands] 承担）。
      */
-    suspend fun kickClient(client: ClientDevice): String? {
-        val cmd = kickClientCmd(client.mac, client.iface)
-            ?: return "MAC 地址非法，无法踢出"
-        return try {
-            shellWithTokenRetry(cmd)
-            // 指令已下发即返回成功：`iw station del` 成功时无输出、失败才写 stderr，
-            // run_shell 只回 stdout，无法进一步区分，故以"随后列表里是否还有它"为准。
-            null
+    var wifiApList by mutableStateOf<List<WifiAp>?>(null)
+        private set
+
+    suspend fun refreshWifiApConfig() {
+        wifiApList = page("wifiSettings", emptyList()) {
+            val o = goform.get(listOf("queryAccessPointInfo"), multiData = true)
+            WifiAp.collect(o.getAsJsonArray("ResponseList"))
+        }
+    }
+
+    /**
+     * 保存一个频段的 WiFi 配置 —— 与设备网页版完全同款：
+     * `goformId=setAccessPointInfo`、`Password` 要 base64、开放网络改提交
+     * `EncrypType=NONE` 且不带 Password，成功判据 `result == 'success'`
+     * （`goformAction` 已封装重试与判定）。
+     *
+     * ⚠️ **保存后该频段 WiFi 会重启**：连着它的设备（包括本机）都会断开几秒；
+     * SSID / 密码改了的话还要用新凭据重连 —— UI 必须先弹确认再提交。
+     */
+    suspend fun setWifiAp(cfg: WifiAp): String = safe {
+        val params = buildMap {
+            put("SSID", cfg.ssid)
+            put("AuthMode", cfg.authMode)
+            if (cfg.isOpen) {
+                put("EncrypType", "NONE")
+            } else {
+                put("Password", java.util.Base64.getEncoder().encodeToString(cfg.password.toByteArray()))
+            }
+            put("ApBroadcastDisabled", if (cfg.broadcastDisabled) "1" else "0")
+            put("ApIsolate", "0")
+            put("ChipIndex", cfg.chipIndex.toString())
+            put("AccessPointIndex", cfg.apIndex)
+            put("Pmf_switch", cfg.pmf)
+        }
+        goformAction("setAccessPointInfo", params)
+    }
+
+
+    // ------------------------------------------------------------------ 拉黑终端
+
+    /** 设备黑名单（含 AclMode）。null = 尚未读到（界面显示加载中）。 */
+    var aclState by mutableStateOf<AclState?>(null)
+        private set
+
+    /** 黑名单列表读取失败的提示，null 表示正常 */
+    var aclError by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * 刷新黑名单。
+     *
+     * 走 `cmd=station_list,lan_station_list,queryDeviceAccessControlList,hostNameList`
+     * （**必须整体、不能带 multi_data**，详见 [GoformClient.deviceAccessControlList]）
+     * 且**需要登录 Cookie** —— 未登录时设备回 `{}`，读不出任何东西。
+     *
+     * 因此这里先确保 cookie 再读。读失败（含未登录）时**保留上一次的值**
+     * （与 [refreshSmsForward] 同策略），避免网络抖动把已拉黑的条目在界面上清空。
+     */
+    suspend fun refreshBlacklist() {
+        val state = try {
+            val cookie = ensureCookie() ?: run {
+                aclError = ACL_LOGIN_FAILED_MSG
+                return
+            }
+            goform.deviceAccessControlList(cookie)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.message ?: "踢出失败"
+            aclError = e.message ?: "读取黑名单失败"
+            return
+        }
+        if (state == null) {
+            // 设备没返回 AclMode —— 多半是会话过期，清 cookie 让下次重登
+            goformCookie = null
+            aclError = ACL_READ_FAILED_MSG
+            return
+        }
+        aclState = state
+        aclError = null
+    }
+
+    /**
+     * 拉黑一台终端。
+     *
+     * 契约对齐设备 Web 端的 `setOrRemoveDeviceFromBlackList`：把该终端 MAC 追加进
+     * 黑名单列表后**整体写回**。
+     *
+     * ⚠️ 名称字段（`BlackNameList`）实测**中文会被设备丢弃**，且与 MAC 列表不同序，
+     * 因此只作"尽力而为"的附加信息写入，界面一律以 MAC 为准。
+     *
+     * @return 成功返回 null；失败返回可读原因（供界面提示）
+     */
+    suspend fun blockClient(client: ClientDevice): String? = safeWithReason {
+        if (aclState?.containsMac(client.mac) == true) return@safeWithReason null
+        val cur = ensureAclState() ?: return@safeWithReason aclError ?: ACL_READ_FAILED_MSG
+        val next = AclState.withEntry(cur, client.mac, clientNameOf(client))
+        writeAndRefreshAcl(next)
+    }
+
+    /** 从黑名单移除一条（MAC 大小写不敏感） */
+    suspend fun unblockMac(mac: String): String? = safeWithReason {
+        val cur = ensureAclState() ?: return@safeWithReason aclError ?: ACL_READ_FAILED_MSG
+        val next = AclState.withoutMac(cur, mac)
+        writeAndRefreshAcl(next)
+    }
+
+    /**
+     * 覆盖写入整个黑名单（黑名单编辑页用）。
+     *
+     * 设备端要求名称列表与 MAC 列表同长度，这里补齐/截断到等长后再提交；
+     * 但设备**可能丢弃名称**（见 [blockClient] 的说明），回读后以设备结果为准。
+     */
+    suspend fun saveBlacklist(macs: List<String>, names: List<String>): String? = safeWithReason {
+        val cur = ensureAclState() ?: return@safeWithReason aclError ?: ACL_READ_FAILED_MSG
+        val cleanMacs = macs.map { it.trim() }.filter { it.isNotEmpty() }
+        val cleanNames = cleanMacs.indices.map { names.getOrNull(it)?.trim().orEmpty() }
+        writeAndRefreshAcl(cur.copy(blackMacs = cleanMacs, blackNames = cleanNames))
+    }
+
+    /** 拿当前黑名单：优先用已有状态，没有就先读一次。返回 null 表示读不到。 */
+    private suspend fun ensureAclState(): AclState? {
+        aclState?.let { return it }
+        refreshBlacklist()
+        return aclState
+    }
+
+    /** 写黑名单并**以设备回读结果覆盖本地状态**（设备会重排/丢名，本地不可信） */
+    private suspend fun writeAndRefreshAcl(next: AclState): String? {
+        val err = writeAcl(next)
+        if (err == null) refreshBlacklist()
+        return err
+    }
+
+    /**
+     * 写黑名单到设备。返回 null 表示成功，否则为失败原因。
+     *
+     * 会话过期时（设备回 `result:"1"`）清掉缓存 cookie 重登一次再写，
+     * 与 [goformAction] 的重试策略一致。
+     */
+    private suspend fun writeAcl(state: AclState): String? {
+        return try {
+            var cookie = ensureCookie()
+            if (cookie.isNullOrBlank()) return ACL_LOGIN_FAILED_MSG
+            var result = goform.setDeviceAccessControlList(cookie, state)
+            if (result == "1" || result == "3") {
+                goformCookie = null
+                cookie = ensureCookie()
+                if (cookie.isNullOrBlank()) return ACL_LOGIN_FAILED_MSG
+                result = goform.setDeviceAccessControlList(cookie, state)
+            }
+            if (result.equals("success", true) || result == "0") null
+            else if (result == "1" || result == "3") ACL_LOGIN_FAILED_MSG
+            else "操作失败($result)"
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            "操作失败：${e.message ?: "网络异常"}"
+        }
+    }
+
+    /** 该终端是否已被拉黑 */
+    fun isBlocked(mac: String): Boolean = aclState?.containsMac(mac) == true
+
+    // ------------------------------------------------------------------ 设备系统设置（设置页「系统设置」组）
+
+    /**
+     * 休眠时间（分钟）；`-1` = 从不休眠。
+     *
+     * `null` 有两种可能，界面都要当作"读不到"处理、不显示该项：
+     * ① 还没读过（进页面时才会拉）；② 设备不支持该字段（回空串）。
+     */
+    var sleepMinutes by mutableStateOf<Int?>(null)
+        private set
+
+    /** 内网设置；null = 没读到 */
+    var lanSetting by mutableStateOf<LanSetting?>(null)
+        private set
+
+    /** 蜂窝数据开关；null = 没读到 */
+    var cellularOn by mutableStateOf<Boolean?>(null)
+        private set
+
+    /**
+     * NFC 状态。`supported == false` 时设置页**不显示 NFC 入口**——
+     * 设备按硬件能力决定是否支持，直接照抄这个判据比猜机型可靠。
+     */
+    var nfcState by mutableStateOf<NfcState>(NfcState(supported = false))
+        private set
+
+    /** USB 调试（ADB）开关；null = 没读到 */
+    var usbDebugOn by mutableStateOf<Boolean?>(null)
+        private set
+
+    /**
+     * 拉取「系统设置」组里几个新条目的状态。
+     *
+     * 逐项独立 try/catch：这四项走的是四条不同的通道（goform 免鉴权 / goform 需 Cookie /
+     * `/api/`），任一项失败不该把其余项一起拖没。失败项保持 null，界面自然不显示。
+     *
+     * 只在进入设置页时调一次，不进主轮询——这些都是**低频改动**的配置，
+     * 每小时都不会变一次，没必要占轮询预算。
+     */
+    suspend fun refreshDeviceSettings() {
+        // 休眠：免鉴权 goform，最轻
+        try {
+            sleepMinutes = goform.sleepMinutes()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+
+        // 内网：免鉴权 goform（读走 lan_ipaddr 那组）
+        try {
+            lanSetting = goform.lanSetting()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+
+        // 数据开关：免鉴权 goform
+        try {
+            cellularOn = goform.cellularDataOn()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+
+        // NFC：免鉴权 goform（先问能力再问状态）
+        try {
+            nfcState = goform.nfcState()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+
+        // USB 调试：只能走 /api/，令牌失效时重取一次
+        try {
+            usbDebugOn = api.adbUsbDebugOn()
+        } catch (e: ApiException) {
+            if (e.code == 401) {
+                try {
+                    api.refreshDeviceToken()
+                    usbDebugOn = api.adbUsbDebugOn()
+                } catch (_: Exception) {
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 设置休眠时间；[minutes] 传 -1 表示从不休眠。返回 null = 成功，否则为失败原因。
+     *
+     * 命名用 `applyXxx` 而不是 `setXxx`：Kotlin 的 `var sleepMinutes` 已经生成了
+     * JVM 方法 `setSleepMinutes(int)`，同名手写会撞签名（真实编译错误，首构建踩过）。
+     */
+    suspend fun applySleepMinutes(minutes: Int): String? = safeWithReason {
+        val err = goformWrite("休眠时间") { cookie -> goform.setSleepMinutes(cookie, minutes) }
+        if (err == null) {
+            sleepMinutes = minutes
+            // 回读一次拿设备认定的值（设备可能把不支持的档位归一成别的）
+            sleepMinutes = try {
+                goform.sleepMinutes()
+            } catch (_: Exception) {
+                minutes
+            }
+        }
+        err
+    }
+
+    /**
+     * 保存内网设置。
+     *
+     * ⚠️⚠️ **设备会重启网络服务**，本机 WiFi 会短暂断开、需要用新网关重连。
+     * 界面**必须先做二次确认**再调这里。改动生效后原地址可能不通，
+     * 因此这里不自动重连、也**不自动回读**（回读大概率超时），只回报写入结果。
+     */
+    suspend fun applyLanSetting(next: LanSetting): String? = safeWithReason {
+        IpValidator.validate(next)?.let { return@safeWithReason it }
+        goformWrite("内网设置") { cookie -> goform.setLanSetting(cookie, next) }
+    }
+
+    /**
+     * 开关蜂窝数据。
+     *
+     * 写完之后**轮询回读确认**（与设备 Web 端 `waitForCellularState` 同思路）：
+     * 这两个 goformId 回 `success` 只代表收到指令，真正断开/拨号要几秒，
+     * 不确认就回报"成功"很容易骗到用户。
+     */
+    suspend fun setCellularData(on: Boolean): String? = safeWithReason {
+        val err = goformWrite("数据开关") { cookie -> goform.setCellularData(cookie, on) }
+        if (err != null) return@safeWithReason err
+
+        // 最多等 8 秒，每 600ms 探一次
+        var latest: Boolean? = null
+        repeat(13) {
+            delay(600)
+            latest = try {
+                goform.cellularDataOn()
+            } catch (_: Exception) {
+                null
+            }
+            if (latest == on) {
+                cellularOn = latest
+                return@safeWithReason null
+            }
+        }
+        cellularOn = latest
+        "指令已下发，但设备尚未切换到「${if (on) "开" else "关"}」状态，请稍后刷新查看"
+    }
+
+    /** 开关 NFC（并选择配对 WiFi；只切开关时传当前 [NfcState.ap] 即可） */
+    suspend fun setNfc(enabled: Boolean, ap: String = nfcState.ap): String? = safeWithReason {
+        val err = goformWrite("NFC") { cookie -> goform.setNfc(cookie, enabled, ap) }
+        if (err == null) {
+            nfcState = try {
+                goform.nfcState()
+            } catch (_: Exception) {
+                nfcState.copy(enabled = enabled, ap = ap)
+            }
+        }
+        err
+    }
+
+    /**
+     * 开关 USB 调试（ADB）。
+     *
+     * ⚠️ 关掉 ADB 后本机 `adb connect` 会断开——这是**预期行为**，不是 bug。
+     * 该开关走 `/api/adb/mode`，不走 goform。
+     */
+    suspend fun setUsbDebug(enabled: Boolean): String? {
+        val r = safe { api.setAdbUsbDebug(enabled) }
+        return if (r == "success") {
+            usbDebugOn = enabled
+            null
+        } else {
+            r
+        }
+    }
+
+    /**
+     * goform 写入的公共外壳：确保 cookie、失败时重登重试一次、统一判据。
+     *
+     * 与 [writeAcl] 同一套策略，抽出来给新增的几个 goform 写操作共用，
+     * 免得每加一项就把"清 cookie 重登"的逻辑抄一遍。
+     *
+     * @return null = 成功；否则为失败原因
+     */
+    private suspend fun goformWrite(
+        label: String,
+        action: suspend (cookie: String) -> String
+    ): String? {
+        return try {
+            var cookie = ensureCookie()
+            if (cookie.isNullOrBlank()) return "$label 失败：$LOGIN_FAILED_MSG"
+            var result = action(cookie)
+            // 设备的会话失效码：本服务 "1"、老固件 "3"
+            if (result == "1" || result == "3") {
+                goformCookie = null
+                cookie = ensureCookie()
+                if (cookie.isNullOrBlank()) return "$label 失败：$LOGIN_FAILED_MSG"
+                result = action(cookie)
+            }
+            when {
+                result.equals("success", true) || result == "0" -> null
+                result == "1" || result == "3" -> "$label 失败：$LOGIN_FAILED_MSG"
+                else -> "$label 失败($result)"
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            "$label 失败：${e.message ?: "网络异常"}"
         }
     }
 
@@ -614,6 +1753,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // 漫游取值为 "on"/"off"，读回以 `dial_roam_setting_option` 为准（官方 Web 端同此）。
             "queryWiFiModuleSwitch", "roam_setting_option", "dial_roam_setting_option",
             "neighbor_cell_info", "locked_cell_info", "sim_slot", "dual_sim_support",
+            // QoS：QCI 等级 + 合约速率（AMBR，单位 Mbps）。
+            //
+            // ⚠️ 合约速率的字段名是 **`ambr_dl_max` / `ambr_ul_max`**（带 `_max` 后缀）——
+            // 不带后缀的 `ambr` / `ambr_dl` / `ambr_ul` 实测**全部返回空 `{}`**，
+            // 这曾经导致误判「U60Pro 拿不到合约速率」。
+            //
+            // 真实字段名是在设备网页版的脚本里翻到的（它渲染 `ambr_dl_max`），
+            // 实测三个字段**未登录也能读、可 multi_data 批量取**，一次轮询全拿到。
+            //
+            // 历史：中间实现过「grep 设备日志 /data/logfs/key.log 的 session_ambr_*」，
+            // 虽然能用但要 shell 权限、要扫 2.8MB 日志（0.74 秒），已被本方案取代。
+            // 两者的值同源（网页版注释也写明它自己是从 key.log 取的），故无精度差异。
+            "qci", "ambr_dl_max", "ambr_ul_max",
             "sms_unread_num", "battery", "battery_value", "battery_vol_percent",
             "battery_charging", "battery_temperature", "uptime",
             // 设备标识
@@ -639,6 +1791,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
          */
         const val POWER_MIN_INTERVAL_MS = 2_000L
 
+
         /** 设备网络信息的 ubus 服务名（`nwinfo_get_netinfo` / `nwinfo_set_netselect`） */
         private const val NWINFO_SERVICE = "zte_nwinfo_api"
 
@@ -657,6 +1810,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
          * 但流量等数值会持续缓慢变化，太频繁会让桌面上不断重绘。
          */
         const val WIDGET_PUSH_MIN_INTERVAL_MS = 10_000L
+
+        /**
+         * 检查更新前，等待「网络可用」的最长时间。
+         *
+         * 冷启动时网络栈/DNS 就绪通常只要 1~3 秒，8 秒足够覆盖；
+         * 超过这个时间基本可以判定是真的没网，没必要继续等。
+         */
+        private const val NETWORK_WAIT_TIMEOUT_MS = 8_000L
+
+        /** 等待网络时的轮询间隔 */
+        private const val NETWORK_POLL_INTERVAL_MS = 300L
+
+        /**
+         * 检查更新首次失败后的补试间隔。
+         *
+         * 网络刚就绪的一瞬间 DNS 可能还没生效，隔 1.2 秒再问一次能显著提高成功率，
+         * 又不会让手动点击的用户等太久。
+         */
+        private const val UPDATE_RETRY_DELAY_MS = 1_200L
 
         /**
          * 短信转发开关的最小刷新间隔。
@@ -835,6 +2007,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             } catch (_: Exception) {
             }
         }
+
+        // 注：QCI 与合约速率（ambr_dl_max / ambr_ul_max）已并入 [POLL_FIELDS]，
+        // 随主轮询一起取，这里不再需要单独的刷新步骤。
+        // （曾有一版单独 grep 设备日志 /data/logfs/key.log 的实现，已废弃。）
 
         // 数据有了就同步给桌面小组件：直接用内存里刚拿到的值，不再多发一次请求
         if (baseOk || liveOk) pushWidgetSnapshot()
@@ -1298,8 +2474,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         block()
     } catch (e: ApiException) {
         e.message ?: "操作失败"
+    } catch (e: ClashException) {
+        // 面板异常自带「地址错 / secret 错 / 超时」这类可读文案，直接透传
+        e.message ?: "面板操作失败"
     } catch (e: kotlinx.coroutines.CancellationException) {
         throw e // 协程取消要原样抛出，否则会吞掉取消信号
+    } catch (e: Exception) {
+        "操作失败：${e.message ?: "未知错误"}"
+    }
+
+    /**
+     * 与 [safe] 同源，但约定 **null = 成功**、非 null 字符串 = 失败原因。
+     *
+     * 黑名单这类「成功无需文案、失败才提示」的操作用它更顺手：
+     * 界面写 `val err = vm.blockClient(c); if (err != null) toast(err)`，
+     * 不必再区分 `"success"` 这个魔法字符串。
+     *
+     * ⚠️ 同样**绝不向上抛**（原因见 [safe]）。
+     */
+    private suspend fun safeWithReason(block: suspend () -> String?): String? = try {
+        block()
+    } catch (e: ApiException) {
+        e.message ?: "操作失败"
+    } catch (e: ClashException) {
+        e.message ?: "面板操作失败"
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
     } catch (e: Exception) {
         "操作失败：${e.message ?: "未知错误"}"
     }
@@ -1541,19 +2741,112 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ 插件商店（§14）
 
+    /**
+     * 刷新**设备上已安装**的插件列表。
+     *
+     * 数据源与商店列表完全无关：读 `/api/get_custom_head` 的 `text`，
+     * 里面每个插件是一段 `[KANO_PLUGIN_START]` … `[KANO_PLUGIN_END]` 块，
+     * 块首可能有一行 `[KANO_META]` 台账（版本 / 商店编号 / 原始文件名），
+     * 详见 [InstalledPlugin]。
+     *
+     * 这个接口**不会因设备令牌失效而崩**：走 `getJson`，401 时 `page` 会把错误
+     * 记进 `pageError["installedPlugins"]`，列表保持上一次的值。
+     */
+    suspend fun refreshInstalledPlugins() {
+        val list = page("installedPlugins", null as List<InstalledPlugin>?) {
+            val root = api.getCustomHead()
+            val text = root.get("text")?.takeIf { it.isJsonPrimitive }?.asString
+            InstalledPlugin.parseAll(text)
+        }
+        if (list != null) {
+            installedPluginList = list
+            // 同步给商店列表用来打「已安装」标记：块名与商店公开名/安装名都算命中
+            installedPlugins = buildSet {
+                list.forEach {
+                    add(it.name)
+                    if (it.publicName.isNotBlank()) add(it.publicName)
+                    if (it.sid.isNotBlank()) add(it.sid)
+                }
+            }
+        }
+    }
+
+    /**
+     * 卸载已安装插件。
+     *
+     * 与商店的 [uninstallPlugin] 是**两条不同的路**：
+     * - 商店卸载走 `/api/plugin/uninstall`（按商店的 name 卸）；
+     * - 这里走 `/api/set_custom_head` —— 把对应块从 `custom_head` 文本里删掉再整体写回。
+     *
+     * 之所以要两条路：设备上有些插件是手工贴进 custom_head 的脚本，
+     * 商店里根本没有对应条目，只能按块名删。官方的「插件管理」用的也是这条。
+     *
+     * @return null = 成功；否则为失败原因
+     */
+    suspend fun removeInstalledPlugin(plugin: InstalledPlugin): String? = safeWithReason {
+        val root = api.getCustomHead()
+        val text = root.get("text")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        if (text.isBlank()) return@safeWithReason "读取设备插件列表失败"
+
+        val next = stripPluginBlocks(text, setOf(plugin.name))
+        if (next == text) return@safeWithReason "设备上已找不到「${plugin.name}」"
+
+        val err = api.setCustomHead(next)
+        if (err != "success") return@safeWithReason err
+        refreshInstalledPlugins()
+        refreshPlugins()
+        null
+    }
+
+    /**
+     * 调整已安装插件的顺序。
+     *
+     * 插件在 `custom_head` 里是**顺序执行**的，排在前面的先跑 —— 有依赖关系时顺序有意义
+     * （例如某个插件要给后面的插件挂 UI 容器）。所以这里不是纯展示排序，
+     * 而是真的把文本块按新顺序重排后写回设备。
+     */
+    suspend fun reorderInstalledPlugin(from: Int, to: Int): String? = safeWithReason {
+        val list = installedPluginList
+        if (from !in list.indices || to !in list.indices || from == to) return@safeWithReason null
+
+        val root = api.getCustomHead()
+        val text = root.get("text")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        if (text.isBlank()) return@safeWithReason "读取设备插件列表失败"
+
+        // 按块切分（保留块外内容），再只重排插件块之间的相对位置
+        val next = reorderPluginBlocks(text, from, to)
+        val err = api.setCustomHead(next)
+        if (err != "success") return@safeWithReason err
+
+        // 本地也按新序排一次，避免等回读
+        val reordered = list.toMutableList().apply { add(to, removeAt(from)) }
+        installedPluginList = reordered
+        null
+    }
+
     suspend fun refreshPlugins() {
         data class PluginBundle(val installed: Set<String>, val store: List<StorePlugin>)
 
         val b = page("plugins", null as PluginBundle?) {
-            val installedRoot = try { api.pluginList() } catch (_: Exception) { JsonObject() }
+            // 已安装集合从 custom_head 取（唯一权威来源）。
+            // 以前这里读的是 `/api/plugin/list` 的 `plugins` 数组，但实测该接口返回的是
+            // **商店全量**、根本没有 `plugins` 键，于是这个集合恒为空、商店条目的
+            // 「已安装」标记从来没生效过。改读 custom_head 的插件块名 / 台账名。
             val installedSet = mutableSetOf<String>()
-            installedRoot.get("plugins")?.takeIf { it.isJsonArray }?.asJsonArray?.forEach { el ->
-                if (el.isJsonObject) {
-                    val o = el.asJsonObject
-                    o.get("name")?.takeIf { !it.isJsonNull }?.asString?.let { installedSet += it }
-                    o.get("public_name")?.takeIf { !it.isJsonNull }?.asString?.let { installedSet += it }
+            try {
+                val root = api.getCustomHead()
+                val text = root.get("text")?.takeIf { it.isJsonPrimitive }?.asString
+                InstalledPlugin.parseAll(text).forEach { p ->
+                    // 同时登记「原名」与「剥掉扩展名的原名」：
+                    // 设备块名是 `u60屏幕管理插件`，商店的 installName 可能是 `u60屏幕管理插件.txt`，
+                    // 不归一化就匹配不上（商店条目的「已安装」标记会不亮）。
+                    listOf(p.name, p.publicName, p.sid)
+                        .filter { it.isNotBlank() }
+                        .forEach { installedSet += it; installedSet += stripExt(it) }
                 }
+            } catch (_: Exception) {
             }
+
             val storeRoot = try { api.pluginsStore() } catch (_: Exception) { JsonObject() }
             PluginBundle(installedSet, StorePlugin.collect(storeRoot, installedSet))
         }
@@ -1620,6 +2913,76 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** ttyd 服务地址，供外部浏览器打开 */
     fun ttydUrl(port: Int = 1146): String = "http://${config.host}:$port"
+
+    /**
+     * 设备上「网页版 UFI-TOOLS」的地址。
+     *
+     * 网页版与 App 用的是**同一个服务、同一个端口** ——
+     * `ufi-tools-u60pro` 进程同时监听 `:2333`（实测 `netstat` 确认），
+     * 既提供 App 调的 `/api/` 下的接口，也直接吐网页界面（`GET /` 返回 177KB 的
+     * `lang="zh-cn"` 页面）。所以地址就是 [DeviceConfig.baseUrl]，
+     * 不需要另拼端口。
+     *
+     * ⚠️ 别跟设备原生 Web 后台搞混：那是 uhttpd 在 **80 端口**上的
+     * 中兴自带界面（`/usr/zte_web/web`，25KB），与本项目的网页版完全不是一回事。
+     *
+     * ⚠️ 写 KDoc 时注意：`/api/` 后面直接跟星号会被当成**注释起始**，
+     * 导致后面的内容全被吞掉（编译报 "Unclosed comment"）。
+     * 本注释上方原本写的就是这个形式，已改掉。
+     */
+    fun webUiUrl(): String = config.baseUrl
+
+    /**
+     * 网页版自动登录是否已经尝试过。
+     *
+     * ⚠️ 这个标志是**故意跨页面实例保持**的（放在 ViewModel 而不是 WebScreen 的
+     * `remember`）：网页版的「登出」按钮会清掉 localStorage 里的凭据，
+     * 如果每次进页面都重新注入，就等于"用户登出无效、一进来又被登回去"。
+     *
+     * 现在的语义：App 启动后**第一次**进入网页版自动登录；用户若主动登出，
+     * 再进出本页也不会被打扰，直到下次冷启动 App。
+     */
+    var webAutoLoginDone = false
+
+    /**
+     * 组装网页版自动登录凭据；返回 null 表示凭据不全、不做自动登录。
+     *
+     * 取值与理由见 [WebAutoLogin] 的详细说明（网页版把登录态放在 localStorage
+     * 的 `kano_sms_pwd` / `kano_sms_token` 两个键里）。
+     */
+    fun webAutoLogin(): WebAutoLogin? {
+        val pwd = config.adminPassword.trim()
+        val token = config.token.trim()
+        // 两个都必填：网页版 initRequestData 里 `!PWD` 与 `isNeedToken && !TOKEN`
+        // 任一成立就判定未登录，缺一个注入也没用。
+        if (pwd.isEmpty() || token.isEmpty()) return null
+        return WebAutoLogin(password = pwd, tokenHash = Crypto.sha256Hex(token))
+    }
+
+    /**
+     * 网页版应使用的配色参数。
+     *
+     * 三个色值都按当前明暗模式从配色表取：
+     * - `pageBg` —— **App 顶栏那片的颜色**（页面背景），用作网页背景
+     * - `textPrimary` —— 主文字色，保证正文与背景的对比度
+     * - `accent` —— 强调色，换算成 HSV 后让网页的按钮/标题跟随主题色调
+     *
+     * ⚠️ 背景取的是 `pageBg`（页面背景 / 顶栏），**不是 `cardBg`（底栏）** ——
+     * 梦幻紫下实测两者不同：顶栏 `rgb(26,22,48)`、底栏 `rgb(39,32,68)`。
+     *
+     * 「默认」主题的强调色是纯灰（饱和度 0），此时色调字段为 null、只同步背景与文字，
+     * 详见 [WebThemeMapper]。
+     */
+    fun webTheme(): WebTheme {
+        val palette = ThemePalettes.ALL.firstOrNull { it.id == paletteId }
+            ?: ThemePalettes.ALL.first()
+        val isDark = themeStore.resolveIsDark()
+        return WebThemeMapper.from(
+            accentArgb = if (isDark) palette.accentDark else palette.accentLight,
+            pageBgArgb = if (isDark) palette.pageBgDark else palette.pageBgLight,
+            textPrimaryArgb = if (isDark) palette.textPrimaryDark else palette.textPrimaryLight
+        )
+    }
 
     suspend fun refreshAdbInfo() {
         adbInfo = page("adb", null as JsonObject?) {
@@ -1720,6 +3083,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         stopPolling()
+        // 日志是长连接，ViewModel 没了必须显式释放，否则连接会挂到进程结束
+        clashLog.release()
         super.onCleared()
     }
 }

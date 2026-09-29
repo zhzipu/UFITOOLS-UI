@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Dashboard
-import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.Sms
@@ -31,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -41,10 +41,11 @@ import androidx.navigation.compose.rememberNavController
 import com.ufitools.client.ui.screens.ApnScreen
 import com.ufitools.client.ui.screens.AppearanceScreen
 import com.ufitools.client.ui.screens.AtCommandScreen
+import com.ufitools.client.ui.screens.BlacklistScreen
+import com.ufitools.client.ui.screens.ClashScreen
 import com.ufitools.client.ui.screens.ConnectionScreen
 import com.ufitools.client.ui.screens.DashboardScreen
 import com.ufitools.client.ui.screens.DeviceAdvancedScreen
-import com.ufitools.client.ui.screens.DeviceInfoScreen
 import com.ufitools.client.ui.screens.PluginStoreScreen
 import com.ufitools.client.ui.screens.ScheduledTaskScreen
 import com.ufitools.client.ui.screens.SettingsScreen
@@ -54,7 +55,8 @@ import com.ufitools.client.ui.screens.SmsScreen
 import com.ufitools.client.ui.screens.TerminalServiceScreen
 import com.ufitools.client.ui.screens.UploadManagerScreen
 import com.ufitools.client.ui.screens.UsageHistoryScreen
-import com.ufitools.client.ui.screens.WifiQrcodeScreen
+import com.ufitools.client.ui.screens.WebScreen
+import com.ufitools.client.ui.screens.WifiSettingsScreen
 import com.ufitools.client.ui.components.UpdateDialog
 import com.ufitools.client.ui.components.openUrl
 import com.ufitools.client.ui.theme.AppTheme
@@ -78,14 +80,26 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class TabItem(val route: String, val label: String, val icon: ImageVector)
+/**
+ * 底栏一项。
+ *
+ * 图标支持两种来源：[icon] 走 Material 矢量图标（会被 tint 染色），
+ * [iconRes] 走位图资源（必须自带 alpha 掩码才能正确染色，见 drawable 下的 ic_cat.png）。
+ * 两者互斥，谁非空用谁。
+ */
+private data class TabItem(
+    val route: String,
+    val label: String,
+    val icon: ImageVector? = null,
+    @androidx.annotation.DrawableRes val iconRes: Int? = null,
+)
 
 private val tabs = listOf(
-    TabItem("dashboard", "仪表盘", Icons.Filled.Dashboard),
-    TabItem("signal", "信号", Icons.Filled.SignalCellularAlt),
-    TabItem("device", "设备", Icons.Filled.Devices),
-    TabItem("sms", "短信", Icons.Filled.Sms),
-    TabItem("settings", "设置", Icons.Filled.Settings)
+    TabItem("dashboard", "仪表盘", icon = Icons.Filled.Dashboard),
+    TabItem("signal", "信号", icon = Icons.Filled.SignalCellularAlt),
+    TabItem("clash", "猫猫", iconRes = R.drawable.ic_cat),
+    TabItem("sms", "短信", icon = Icons.Filled.Sms),
+    TabItem("settings", "设置", icon = Icons.Filled.Settings)
 )
 
 @Composable
@@ -136,7 +150,17 @@ fun App(vm: MainViewModel) {
                                 restoreState = true
                             }
                         },
-                        icon = { Icon(tab.icon, contentDescription = tab.label) },
+                        icon = {
+                            val v = tab.icon
+                            if (v != null) {
+                                Icon(v, contentDescription = tab.label)
+                            } else {
+                                Icon(
+                                    painter = painterResource(tab.iconRes!!),
+                                    contentDescription = tab.label
+                                )
+                            }
+                        },
                         label = { Text(tab.label, style = androidx.compose.material3.MaterialTheme.typography.labelMedium) },
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = AppTheme.accent,
@@ -157,7 +181,10 @@ fun App(vm: MainViewModel) {
         ) {
             composable("dashboard") { DashboardScreen(vm, nav) }
             composable("signal") { SignalScreen(vm) }
-            composable("device") { DeviceInfoScreen(vm) }
+            // Clash 面板：原生 UI 直连 mihomo external-controller，不内嵌 WebView
+            composable("clash") { ClashScreen(vm, nav) }
+            // 注：「设备信息」不再是独立路由——已收进仪表盘右上角的「i」弹窗，
+            // 见 DashboardScreen 里的 DeviceInfoDialog
             composable("sms") { SmsScreen(vm) }
             composable("settings") { SettingsScreen(vm, nav) }
             composable("appearance") { AppearanceScreen(vm, nav) }
@@ -166,12 +193,16 @@ fun App(vm: MainViewModel) {
             composable("apn") { ApnScreen(vm, nav) }
             composable("usage") { UsageHistoryScreen(vm, nav) }
             composable("tasks") { ScheduledTaskScreen(vm, nav) }
-            composable("wifi-qrcode") { WifiQrcodeScreen(vm, nav) }
+            composable("wifi-settings") { WifiSettingsScreen(vm, nav) }
             composable("uploads") { UploadManagerScreen(vm, nav) }
             composable("plugins") { PluginStoreScreen(vm, nav) }
             composable("terminal") { TerminalServiceScreen(vm, nav) }
             composable("sms-forward") { SmsForwardScreen(vm, nav) }
+            composable("blacklist") { BlacklistScreen(vm, nav) }
             composable("device-advanced") { DeviceAdvancedScreen(vm, nav) }
+            // 网页版 UFI-TOOLS：内嵌 WebView，与 App 同源（同一服务 :2333），
+            // 从仪表盘点型号标题进来
+            composable("web") { WebScreen(vm, nav) }
         }
     }
 }

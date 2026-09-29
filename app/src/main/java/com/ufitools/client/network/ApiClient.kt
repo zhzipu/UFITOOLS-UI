@@ -281,6 +281,39 @@ class ApiClient(private val configProvider: () -> DeviceConfig) {
 
     suspend fun adbAlive(): JsonObject = getJson("/api/adb_alive")
 
+    /**
+     * USB 调试（ADB）开关状态。
+     *
+     * ⚠️ 这一项**只能走 `/api/`，goform 读不到**：`cmd=usb_port_switch` 实测恒回 `{}`，
+     * 因为它由后端直接读写 sysfs `/sys/class/android_usb/android0/usb_op`，不经 goform。
+     *
+     * @return `true` = 已开启（`state == "1"`）；读到其他值 / 失败返回 null
+     */
+    suspend fun adbUsbDebugOn(): Boolean? {
+        val o = try {
+            getJson("/api/adb/status")
+        } catch (e: ApiException) {
+            return null
+        }
+        val state = o.get("state")?.takeIf { it.isJsonPrimitive }?.asString ?: return null
+        return when (state) {
+            "1" -> true
+            "0" -> false
+            else -> null
+        }
+    }
+
+    /**
+     * 设置 USB 调试模式。
+     *
+     * 与设备 Web 端的 `setADBMode` 一致：`debug` 开启 / `user` 关闭，
+     * 请求体是 JSON 且**不带**字段包装。这两个值设备只认小写。
+     */
+    suspend fun setAdbUsbDebug(enabled: Boolean): String {
+        val o = postJson("/api/adb/mode", gson.toJson(mapOf("mode" to if (enabled) "debug" else "user")))
+        return if (o.isOk()) "success" else o.errMsg("设置 USB 调试失败")
+    }
+
     // ------------------------------------------------------------------ 语音 / 网络
 
     suspend fun volteStatus(slot: Int = 0): JsonObject = getJson("/api/volte_status?slot=$slot")

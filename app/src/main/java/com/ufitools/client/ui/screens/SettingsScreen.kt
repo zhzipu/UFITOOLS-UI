@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,11 +29,11 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.PowerSettingsNew
-import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.SettingsEthernet
@@ -64,12 +65,17 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufitools.client.BuildConfig
+import com.ufitools.client.R
 import com.ufitools.client.data.RefreshInterval
+import com.ufitools.client.model.IpValidator
+import com.ufitools.client.model.LanSetting
 import com.ufitools.client.model.NetworkMode
 import com.ufitools.client.ui.components.AppCard
+import com.ufitools.client.ui.components.LabeledField
 import com.ufitools.client.ui.components.OptionChip
 import com.ufitools.client.ui.components.SectionTitle
 import com.ufitools.client.ui.components.StaggeredFadeIn
@@ -78,6 +84,7 @@ import com.ufitools.client.ui.components.openUrl
 import com.ufitools.client.ui.theme.AppTheme
 import com.ufitools.client.ui.theme.StatusBad
 import com.ufitools.client.ui.theme.ThemePalettes
+import com.ufitools.client.viewmodel.CLASH_NOT_RUNNING_HINT
 import com.ufitools.client.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -104,6 +111,44 @@ private val SIM_SLOT_OPTIONS = listOf(
     "11" to "双卡同开",
 )
 
+/**
+ * 休眠档位（分钟 → 显示名）。
+ *
+ * `-1` 是设备的"从不休眠"哨兵值，不是负数分钟；取值抄自设备 Web 端
+ * `idx.html` 的 `SLEEP_TIME` 下拉项，设备对不在表里的值会静默忽略。
+ */
+private val SLEEP_OPTIONS = listOf(
+    "-1" to "从不",
+    "5" to "5 分钟",
+    "10" to "10 分钟",
+    "20" to "20 分钟",
+    "30" to "30 分钟",
+    "60" to "1 小时",
+    "120" to "2 小时",
+)
+
+/**
+ * NFC 配对 WiFi 通道。
+ *
+ * `1`=2.4G 主 / `2`=5G 主 / `3`=2.4G 访客 / `4`=5G 访客（取自设备 Web 端 idx.html）。
+ * 设备读回 `web_wifi_nfc_flag` 缺省为 `"2"`（5G 主），所以默认值不能写成空串。
+ */
+private val NFC_AP_OPTIONS = listOf(
+    "1" to "2.4G 主网络",
+    "2" to "5G 主网络",
+    "3" to "2.4G 访客网络",
+    "4" to "5G 访客网络",
+)
+
+private val NFC_AP_LABELS = NFC_AP_OPTIONS.toMap()
+
+/** 休眠分钟数 → 可读摘要；[minutes] < 0 一律显示"从不" */
+private fun sleepSummary(minutes: Int): String {
+    if (minutes < 0) return "从不休眠"
+    val hit = SLEEP_OPTIONS.firstOrNull { it.first == minutes.toString() }
+    return hit?.second ?: "$minutes 分钟"
+}
+
 @Composable
 fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
     val context = LocalContext.current
@@ -119,6 +164,13 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
     var showSimSlot by remember { mutableStateOf(false) }
     var showConfirmReboot by remember { mutableStateOf(false) }
     var showConfirmShutdown by remember { mutableStateOf(false) }
+    var showSleep by remember { mutableStateOf(false) }
+    var showLan by remember { mutableStateOf(false) }
+    var showNfcAp by remember { mutableStateOf(false) }
+
+    // 系统设置组里的几项走独立通道、改动频率极低，只在进页面时拉一次，
+    // 不进主轮询（见 vm.refreshDeviceSettings 的说明）。
+    LaunchedEffect(Unit) { vm.refreshDeviceSettings() }
 
     fun toast(msg: String) = Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
 
@@ -258,6 +310,13 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                     )
                     ThinDivider()
                     ListRow(
+                        title = "黑名单",
+                        subtitle = "禁止指定设备连接 WiFi",
+                        icon = Icons.Filled.Block,
+                        onClick = { nav.navigate("blacklist") }
+                    )
+                    ThinDivider()
+                    ListRow(
                         title = "短信转发",
                         subtitle = if (vm.smsForward) "已开启 · 邮件/CURL/钉钉" else "未开启",
                         icon = Icons.Filled.Link,
@@ -311,11 +370,14 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         run("5G WiFi") { vm.setWifiBand(1, on) }
                     }
                     ThinDivider()
+                    // WiFi 配置（SSID / 密码 / 安全模式 / PMF / 二维码）单独成页 ——
+                    // 内容多，直接嵌在设置列表里会把整页撑得很长。
+                    // 原「WiFi 二维码」入口已并入该页（每个频段一张二维码）。
                     ListRow(
-                        title = "WiFi 二维码",
-                        subtitle = "扫码连接 2.4G / 5G",
-                        icon = Icons.Filled.QrCode,
-                        onClick = { nav.navigate("wifi-qrcode") }
+                        title = "WiFi 设置",
+                        subtitle = "SSID / 密码 / 安全模式 / 二维码",
+                        icon = Icons.Filled.Wifi,
+                        onClick = { nav.navigate("wifi-settings") }
                     )
                     ThinDivider()
                     // 漫游读回以 dial_roam_setting_option 为准（官方 Web 端同此）
@@ -332,6 +394,99 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                         subtitle = live["sim_slot"] ?: "",
                         icon = Icons.Filled.SimCard,
                         onClick = { showSimSlot = true }
+                    )
+
+                    // ---- 以下为新增 6 项（读不到的一律不显示，避免暴露"点了没反应"的空壳） ----
+
+                    // 休眠时间：设备不支持时会回空串（vm.sleepMinutes == null），自动隐藏
+                    vm.sleepMinutes?.let { cur ->
+                        ThinDivider()
+                        ListRow(
+                            title = "休眠时间",
+                            subtitle = sleepSummary(cur),
+                            icon = Icons.Filled.Schedule,
+                            onClick = { showSleep = true }
+                        )
+                    }
+
+                    // 内网设置：网关/掩码/DHCP 地址池；⚠️ 保存后设备重启网络，会断连
+                    vm.lanSetting?.let { lan ->
+                        ThinDivider()
+                        ListRow(
+                            title = "内网设置",
+                            subtitle = "${lan.gateway} / ${lan.netmask}",
+                            icon = Icons.Filled.SettingsEthernet,
+                            onClick = { showLan = true }
+                        )
+                    }
+
+                    // 数据开关：写后要轮询约 8 秒确认，故把乐观值超时放宽到 10 秒，
+                    // 否则开关会在真正生效前先弹回去
+                    vm.cellularOn?.let { on ->
+                        ThinDivider()
+                        SwitchItem(
+                            title = "数据开关",
+                            checked = on,
+                            icon = Icons.Filled.DataUsage,
+                            timeoutMs = 10_000L
+                        ) { want ->
+                            scope.launch {
+                                toast(vm.setCellularData(want) ?: "数据${if (want) "已打开" else "已关闭"}")
+                            }
+                        }
+                    }
+
+                    // NFC：设备按硬件能力决定是否支持（nfcState.supported），不支持则整块不显示
+                    if (vm.nfcState.supported) {
+                        ThinDivider()
+                        SwitchItem("NFC 开关", vm.nfcState.enabled, Icons.Filled.Wifi) { want ->
+                            scope.launch { toast(vm.setNfc(want) ?: "NFC ${if (want) "已开启" else "已关闭"}") }
+                        }
+                        ThinDivider()
+                        ListRow(
+                            title = "NFC 配对 WiFi",
+                            subtitle = NFC_AP_LABELS[vm.nfcState.ap] ?: vm.nfcState.ap,
+                            icon = Icons.Filled.Wifi,
+                            onClick = { showNfcAp = true }
+                        )
+                    }
+
+                    // USB 调试：走 /api/adb/mode。关掉后本机 adb 会断开，属预期行为
+                    vm.usbDebugOn?.let { on ->
+                        ThinDivider()
+                        SwitchItem("USB 调试", on, Icons.Filled.Terminal) { want ->
+                            scope.launch {
+                                toast(
+                                    vm.setUsbDebug(want)
+                                        ?: if (want) "USB 调试已开启" else "USB 调试已关闭（adb 会断开连接）"
+                                )
+                            }
+                        }
+                    }
+
+                    // 工具箱自身更新（GitHub Release），与设备固件 OTA 是两回事
+                    ThinDivider()
+                    ListRow(
+                        title = "UFITOOLS 更新",
+                        subtitle = when {
+                            vm.updateChecking -> "正在检查…"
+                            vm.updateInfo == null -> "从 GitHub 获取最新版本"
+                            vm.updateInfo!!.hasUpdate -> "发现新版本 ${vm.updateInfo!!.version}"
+                            else -> "已是最新版本 $APP_VERSION"
+                        },
+                        icon = Icons.Filled.UploadFile,
+                        onClick = {
+                            val i = vm.updateInfo
+                            if (i?.hasUpdate == true) {
+                                openUrl(context, i.apkUrl ?: i.releaseUrl, "无法打开下载链接")
+                            } else {
+                                // checkUpdate 在"正在检查中"时会返回空串，直接 toast 会出现空气泡
+                                scope.launch {
+                                    val msg = vm.checkUpdate(silent = false)
+                                    if (msg.isNotBlank()) toast(msg)
+                                }
+                            }
+                        }
                     )
                 }
             }
@@ -374,6 +529,18 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                 SectionTitle("扩展能力", Modifier.padding(start = 4.dp, bottom = 8.dp))
                 AppCard(contentPadding = PaddingValues(0.dp)) {
                     ListRow(
+                        title = "猫猫面板",
+                        subtitle = when (vm.clashOnline) {
+                            true -> "已连接 · ${vm.clashVersion?.display ?: ""}"
+                            false -> CLASH_NOT_RUNNING_HINT
+                            // null = 还没探测：进页面时会自动连接，这里给个中性描述
+                            else -> "点击进入，自动连接"
+                        },
+                        iconRes = R.drawable.ic_cat,
+                        onClick = { nav.navigate("clash") }
+                    )
+                    ThinDivider()
+                    ListRow(
                         title = "文件管理",
                         subtitle = "上传图片 / 文件到设备",
                         icon = Icons.Filled.UploadFile,
@@ -381,7 +548,7 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
                     )
                     ThinDivider()
                     ListRow(
-                        title = "插件商店",
+                        title = "插件管理",
                         subtitle = "安装 / 卸载设备插件",
                         icon = Icons.Filled.Extension,
                         onClick = { nav.navigate("plugins") }
@@ -614,6 +781,50 @@ fun SettingsScreen(vm: MainViewModel, nav: NavHostController) {
             onDismiss = { showConfirmShutdown = false }
         )
     }
+    if (showSleep) {
+        OptionPickerDialog(
+            title = "休眠时间",
+            options = SLEEP_OPTIONS,
+            selected = (vm.sleepMinutes ?: -1).toString(),
+            onSelect = { v ->
+                showSleep = false
+                val minutes = v.toIntOrNull()
+                if (minutes != null) {
+                    scope.launch { toast(vm.applySleepMinutes(minutes) ?: "休眠时间已更新") }
+                }
+            },
+            onDismiss = { showSleep = false }
+        )
+    }
+    if (showLan) {
+        vm.lanSetting?.let { cur ->
+            LanSettingDialog(
+                initial = cur,
+                onSubmit = { next ->
+                    showLan = false
+                    // 写入会断网，这里**不**走 run()——run 成功后会 refreshAllNow，
+                    // 而此刻设备正在重启网络，必然超时刷出一堆报错，徒增噪音。
+                    scope.launch {
+                        val r = vm.applyLanSetting(next)
+                        toast(r ?: "内网设置已下发，设备正在重启网络，请稍后用新地址重连")
+                    }
+                },
+                onDismiss = { showLan = false }
+            )
+        }
+    }
+    if (showNfcAp) {
+        OptionPickerDialog(
+            title = "NFC 配对 WiFi",
+            options = NFC_AP_OPTIONS,
+            selected = vm.nfcState.ap,
+            onSelect = { v ->
+                showNfcAp = false
+                scope.launch { toast(vm.setNfc(vm.nfcState.enabled, v) ?: "配对网络已更新") }
+            },
+            onDismiss = { showNfcAp = false }
+        )
+    }
 }
 
 @Composable
@@ -641,6 +852,7 @@ private fun ListRow(
     title: String,
     subtitle: String = "",
     icon: ImageVector? = null,
+    @androidx.annotation.DrawableRes iconRes: Int? = null,
     iconTint: Color = AppTheme.iconTint,
     onClick: () -> Unit
 ) {
@@ -653,6 +865,14 @@ private fun ListRow(
     ) {
         if (icon != null) {
             Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(14.dp))
+        } else if (iconRes != null) {
+            Icon(
+                painter = painterResource(iconRes),
+                contentDescription = null,
+                tint = iconTint,
+                modifier = Modifier.size(20.dp)
+            )
             Spacer(Modifier.width(14.dp))
         }
         Column(Modifier.weight(1f)) {
@@ -675,18 +895,23 @@ private fun SwitchItem(
     title: String,
     checked: Boolean,
     icon: ImageVector? = null,
+    timeoutMs: Long = SWITCH_OPTIMISTIC_TIMEOUT_MS,
     onChange: (Boolean) -> Unit
 ) {
     // Switch 是受控组件，而设备回读有延迟：拨动后会先弹回旧值、约 1 秒后才跳到新值。
     // 用本地 pending 值顶住这段空窗；等外部真实值追平（写入成功）就交还控制权，
     // 迟迟追不平（写入失败）则超时回滚，避免开关一直停在假状态上。
+    //
+    // timeoutMs 可调：多数开关设备 1 秒内就生效，4 秒足够；
+    // 但「数据开关」要等拨号/断链（官方 Web 端给的确认窗口是 8 秒），
+    // 用默认值会在真正生效前就弹回去，看起来像"点了没用"。
     var pending by remember { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(pending, checked) {
         val p = pending ?: return@LaunchedEffect
         if (checked == p) {
             pending = null
         } else {
-            delay(SWITCH_OPTIMISTIC_TIMEOUT_MS)
+            delay(timeoutMs)
             if (pending == p && checked != p) pending = null
         }
     }
@@ -1019,6 +1244,98 @@ private fun ConfirmDialog(
         text = { Text(text, color = AppTheme.textSecondary) },
         confirmButton = {
             TextButton(onClick = onConfirm) { Text("确定", color = AppTheme.accent) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消", color = AppTheme.textSecondary) }
+        },
+        containerColor = AppTheme.cardBg
+    )
+}
+
+/**
+ * 内网设置弹窗（两阶段）。
+ *
+ * ⚠️ 保存后设备会**重启网络服务**，本机与设备的连接会断开、需要按新网段重连。
+ * 因此这里做了两道闸：
+ * 1. 表单本地先跑 [IpValidator.validate]，校验不过直接不给提交（设备对非法值是静默忽略的）；
+ * 2. 校验通过后再弹一次确认，明确写出"会断网 + 新地址是多少"，用户点确认才真正下发。
+ */
+@Composable
+private fun LanSettingDialog(
+    initial: LanSetting,
+    onSubmit: (LanSetting) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var gateway by remember { mutableStateOf(initial.gateway) }
+    var netmask by remember { mutableStateOf(initial.netmask) }
+    var dhcpOn by remember { mutableStateOf(initial.dhcpEnabled) }
+    var start by remember { mutableStateOf(initial.dhcpStart) }
+    var end by remember { mutableStateOf(initial.dhcpEnd) }
+    var lease by remember { mutableStateOf(initial.dhcpLeaseHour) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var confirming by remember { mutableStateOf(false) }
+
+    fun build() = LanSetting(
+        gateway = gateway.trim(),
+        netmask = netmask.trim(),
+        dhcpEnabled = dhcpOn,
+        dhcpStart = start.trim(),
+        dhcpEnd = end.trim(),
+        dhcpLeaseHour = lease.trim(),
+    )
+
+    if (confirming) {
+        val next = build()
+        ConfirmDialog(
+            title = "确认修改内网设置？",
+            text = "保存后设备会「重启网络服务」：\n\n" +
+                "• 本机将与本设备断开，需要重新连接\n" +
+                "• 管理页面随之改为 http://${next.gateway}:2333\n" +
+                "• 若地址已改，旧的 ${initial.gateway} 将无法再访问\n\n" +
+                "确定要继续吗？",
+            onConfirm = { onSubmit(next) },
+            onDismiss = { confirming = false }
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("内网设置", color = AppTheme.textPrimary) },
+        text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                // 输入框统一走公共 LabeledField：它内部给了 heightIn，
+                // 避免滚动容器传 Infinity 约束导致 OutlinedTextField 测量崩溃。
+                LabeledField("网关地址（如 192.168.0.1）", gateway, { gateway = it })
+                Spacer(Modifier.height(10.dp))
+                LabeledField("子网掩码（如 255.255.255.0）", netmask, { netmask = it })
+                Spacer(Modifier.height(6.dp))
+                DialogSwitchRow("启用 DHCP 服务", dhcpOn) { dhcpOn = it }
+                if (dhcpOn) {
+                    Spacer(Modifier.height(4.dp))
+                    LabeledField("地址池起始（如 192.168.0.2）", start, { start = it })
+                    Spacer(Modifier.height(10.dp))
+                    LabeledField("地址池结束（如 192.168.0.253）", end, { end = it })
+                    Spacer(Modifier.height(10.dp))
+                    LabeledField("租期（小时，如 24）", lease, { lease = it })
+                }
+                error?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = StatusBad)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val next = build()
+                val msg = IpValidator.validate(next)
+                if (msg != null) {
+                    error = msg
+                } else {
+                    error = null
+                    confirming = true
+                }
+            }) { Text("应用", color = AppTheme.accent) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消", color = AppTheme.textSecondary) }

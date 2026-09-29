@@ -1,19 +1,30 @@
 package com.ufitools.client.ui.screens
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.google.gson.JsonObject
 import com.ufitools.client.ui.components.AppCard
 import com.ufitools.client.ui.components.KeyValueRow
@@ -25,8 +36,17 @@ import com.ufitools.client.viewmodel.MainViewModel
 private fun JsonObject.s(key: String): String =
     get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""
 
+/**
+ * 设备信息的全部内容。
+ *
+ * 这个页面原来是底栏一个独立 Tab（「设备」），现在改为仪表盘右上角
+ * 「i」按钮弹出的 [DeviceInfoDialog]——设备信息离「我关心这台设备」的主场景更近，
+ * 底栏也少挤一项。本组件即两处共用的唯一内容来源。
+ *
+ * ⚠️ 本组件**不提供滚动容器**，由调用方决定（弹窗里是 `verticalScroll`）。
+ */
 @Composable
-fun DeviceInfoScreen(vm: MainViewModel) {
+fun DeviceInfoContent(vm: MainViewModel) {
     val live = vm.live
     val version = vm.version
     val base = vm.baseInfo
@@ -35,20 +55,7 @@ fun DeviceInfoScreen(vm: MainViewModel) {
         vm.refreshDeviceExtra()
     }
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp)
-    ) {
-        Spacer(Modifier.height(20.dp))
-        Text(
-            "设备信息",
-            style = MaterialTheme.typography.headlineMedium,
-            color = AppTheme.textPrimary
-        )
-        Spacer(Modifier.height(12.dp))
-
+    Column(Modifier.fillMaxWidth()) {
         StaggeredFadeIn(0) { m ->
             Column(m.fillMaxWidth()) {
                 SectionTitle("设备标识", Modifier.padding(start = 4.dp, bottom = 8.dp))
@@ -186,6 +193,62 @@ fun DeviceInfoScreen(vm: MainViewModel) {
         }
 
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+/**
+ * 设备信息弹窗（仪表盘右上角「i」按钮触发）。
+ *
+ * 内容与原来的「设备」页完全一致，直接复用 [DeviceInfoContent]，
+ * 保证两处不会出现字段缺漏。
+ *
+ * 用 `usePlatformDefaultWidth = false` 撑到接近全屏：设备信息有七八个卡片，
+ * 默认对话框那点宽度会把「设备型号 / 固件版本」这类长串挤到换行。
+ */
+@Composable
+fun DeviceInfoDialog(vm: MainViewModel, onDismiss: () -> Unit) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.94f)
+                .fillMaxHeight(0.88f),
+            shape = RoundedCornerShape(20.dp),
+            color = AppTheme.cardBg,
+        ) {
+            Column(Modifier.fillMaxSize()) {
+                // 顶栏：标题 + 关闭
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(start = 20.dp, end = 8.dp, top = 16.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "设备信息",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = AppTheme.textPrimary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Filled.Close, contentDescription = "关闭", tint = AppTheme.iconTint)
+                    }
+                }
+                // 内容自带滚动：卡片很多，必须能滚
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp)
+                ) {
+                    Spacer(Modifier.height(4.dp))
+                    DeviceInfoContent(vm)
+                }
+            }
+        }
     }
 }
 

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自动生成，勿手改：见 .workbuddy/tmp/gen_widget_bg.py
+     配色 3（梦幻紫）· light 模式的卡片底 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#e6ffffff" />
+    <corners android:radius="20dp" />
+</shape>
