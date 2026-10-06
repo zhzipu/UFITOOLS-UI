@@ -1,3 +1,6 @@
+# 设备卖掉了，此项目停止维护，有需要可使用源码魔改。
+
+
 # UFITOOLS-UI
 
 UFI U60 Pro（中兴 MU5250）随身 WiFi 的 **Android 原生控制器**。
